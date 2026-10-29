@@ -60,8 +60,8 @@ fn getAppCodeName(_: *const WorkerNavigator) []const u8 {
     return Navigator.getAppCodeName(&Navigator.init);
 }
 
-fn getAppVersion(_: *const WorkerNavigator) []const u8 {
-    return Navigator.getAppVersion(&Navigator.init);
+fn getAppVersion(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
+    return Navigator.getAppVersion(&Navigator.init, exec);
 }
 
 fn getLanguage(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
@@ -80,8 +80,8 @@ fn getDeviceMemory(_: *const WorkerNavigator) f64 {
     return Navigator.getDeviceMemory(&Navigator.init);
 }
 
-fn getVendor(_: *const WorkerNavigator) []const u8 {
-    return Navigator.getVendor(&Navigator.init);
+fn getVendor(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
+    return Navigator.getVendor(&Navigator.init, exec);
 }
 
 fn getProduct(_: *const WorkerNavigator) []const u8 {
@@ -92,8 +92,8 @@ fn getGlobalPrivacyControl(_: *const WorkerNavigator) bool {
     return Navigator.getGlobalPrivacyControl(&Navigator.init);
 }
 
-fn getPlatform(_: *const WorkerNavigator) []const u8 {
-    return Navigator.getPlatform(&Navigator.init);
+fn getPlatform(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
+    return Navigator.getPlatform(&Navigator.init, exec);
 }
 
 fn getPermissions(self: *WorkerNavigator) *Permissions {

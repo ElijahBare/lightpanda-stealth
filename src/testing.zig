@@ -344,7 +344,26 @@ const HtmlRunnerOpts = struct {
     },
     experimental_features: Config.ExperimentalFeatures = .{},
     force_open_shadow_roots: bool = false,
+    // Run as --stealth (see enableStealth).
+    stealth: bool = false,
 };
+
+/// Switches the shared test config to what --stealth sets up, until the
+/// returned headers are passed back to restoreHttpHeaders.
+pub const stealth_test_user_agent: [:0]const u8 = Config.HttpHeaders.Chrome.user_agent ++ " internal-tester";
+
+pub fn enableStealth() Config.HttpHeaders {
+    const saved = test_config.http_headers;
+    test_config.http_headers.stealth = true;
+    // Suffixed like the regular test user agent, see testing.js.
+    test_config.http_headers.user_agent = stealth_test_user_agent;
+    test_config.http_headers.client_hints = &Config.HttpHeaders.Chrome.hints;
+    return saved;
+}
+
+pub fn restoreHttpHeaders(saved: Config.HttpHeaders) void {
+    test_config.http_headers = saved;
+}
 
 // Create a fresh page on `test_session` and return its root frame — for tests
 // that just need a frame to build a DOM in. The page lives on the session;
@@ -381,6 +400,12 @@ pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
 
     test_session.force_open_shadow_roots = opts.force_open_shadow_roots;
     defer test_session.force_open_shadow_roots = false;
+
+    const saved_headers = test_config.http_headers;
+    if (opts.stealth) {
+        _ = enableStealth();
+    }
+    defer restoreHttpHeaders(saved_headers);
 
     const root = try std.fs.path.joinZ(arena_allocator, &.{ WEB_API_TEST_ROOT, path });
     const stat = std.Io.Dir.cwd().statFile(io, root, .{}) catch |err| {

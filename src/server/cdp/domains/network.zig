@@ -263,7 +263,7 @@ fn setExtraHTTPHeaders(cmd: *CDP.Command) !void {
         }
 
         if (std.ascii.eqlIgnoreCase(key, "user-agent")) {
-            Config.validateUserAgent(value) catch |err| {
+            Config.validateUserAgent(value, .{ .stealth = cmd.cdp.browser.http_client.isStealth() }) catch |err| {
                 log.debug(.cdp, "network.setExtraHTTPHeaders", .{ .param = "userAgent", .value = value, .err = err });
                 continue;
             };
@@ -1905,4 +1905,74 @@ test "cdp.Network: worker requests emit network events" {
         .type = "Fetch",
         .request = .{ .url = api_url },
     }, .{ .session_id = "SID-NW" });
+}
+
+fn expectNetworkJs(frame: *lp.Frame, expression: [:0]const u8) !void {
+    const js = @import("../../../browser/js/js.zig");
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const value = try ls.local.exec(expression, null);
+    try testing.expect(value.toBool());
+}
+
+test "cdp.Network: setUserAgentOverride is reflected in navigator" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    var bc = try ctx.loadBrowserContext(.{ .id = "NID-UAO", .url = "hi.html", .target_id = "FID-0000000UAO".* });
+    const frame = bc.mainFrame() orelse unreachable;
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Network.setUserAgentOverride",
+        .params = .{ .userAgent = "CustomBot/3.0", .platform = "Win32" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try std.testing.expectEqualStrings("CustomBot/3.0", ctx.cdp().browser.http_client.getUserAgent());
+    try expectNetworkJs(frame, "navigator.userAgent === 'CustomBot/3.0' && navigator.platform === 'Win32'");
+
+    // A new override without a platform restores the default one.
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.setUserAgentOverride",
+        .params = .{ .userAgent = "CustomBot/4.0" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    try expectNetworkJs(frame, "navigator.userAgent === 'CustomBot/4.0' && navigator.platform !== 'Win32'");
+}
+
+test "cdp.Network: stealth accepts zendriver's de-headlessed Chrome user agent" {
+    const saved = testing.base.enableStealth();
+    defer testing.base.restoreHttpHeaders(saved);
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    var bc = try ctx.loadBrowserContext(.{ .id = "NID-UAS", .url = "hi.html", .target_id = "FID-0000000UAS".* });
+    const frame = bc.mainFrame() orelse unreachable;
+
+    try expectNetworkJs(frame, "navigator.userAgent.startsWith('Mozilla/5.0 (') && !navigator.userAgent.includes('Headless')");
+
+    // What zendriver's _prepare_headless sends: navigator.userAgent with
+    // "Headless" stripped. Here a Windows one, to see it all follow.
+    const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Network.setUserAgentOverride",
+        .params = .{ .userAgent = ua, .platform = "Win32" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try std.testing.expectEqualStrings(ua, ctx.cdp().browser.http_client.getUserAgent());
+    try expectNetworkJs(frame, "navigator.userAgent.startsWith('Mozilla/5.0 (Windows NT 10.0;')");
+    try expectNetworkJs(frame, "navigator.appVersion === navigator.userAgent.substring(8)");
+    try expectNetworkJs(frame, "navigator.platform === 'Win32' && navigator.vendor === 'Google Inc.'");
+    try expectNetworkJs(frame, "navigator.webdriver === false");
+
+    // A browser User-Agent is a valid extra header too.
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.setExtraHTTPHeaders",
+        .params = .{ .headers = .{ .@"User-Agent" = "Mozilla/5.0" } },
+    });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    try testing.expectEqual(1, ctx.cdp().browser_context.?.extra_headers.items.len);
 }
