@@ -1710,11 +1710,11 @@ test "cdp: every domain answers enable and disable" {
         "LP",        "IO",        "DOM",         "Log",           "CSS",      "Page",
         "Fetch",     "Input",     "Target",      "Audits",        "WebMCP",   "Browser",
         "Runtime",   "Network",   "Storage",     "Console",       "Security", "Debugger",
-        "Emulation", "Inspector", "Performance", "Accessibility",
+        "Emulation", "Inspector", "Performance", "Accessibility", "Overlay",  "DOMStorage",
     };
 
-    // Lacking in files other work is changing; drop an entry once it lands.
-    const missing = [_][]const u8{ "DOM.disable", "Input.enable", "Input.disable", "Browser.enable", "Browser.disable" };
+    // Chrome has no enable/disable on these domains either.
+    const missing = [_][]const u8{ "Input.enable", "Input.disable", "Browser.enable", "Browser.disable" };
 
     var id: usize = 100;
     for (domains) |domain| {
