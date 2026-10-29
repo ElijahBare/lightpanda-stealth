@@ -201,6 +201,10 @@ input_modifiers: if (lp.build_config.wpt_extensions) @import("frame/user_input.z
 // The element the synthetic pointer is currently over
 input_hover_target: ?*Element = null,
 
+// Where the synthetic mouse last was, in the top-level viewport, for the next
+// event's movementX/Y. Null until the first mouse message.
+input_mouse_position: ?@import("frame/user_input.zig").Point = null,
+
 // Touch contact and tap state; see user_input.TouchInput.
 input_touch: @import("frame/user_input.zig").TouchInput = .{},
 

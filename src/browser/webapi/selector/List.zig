@@ -621,6 +621,25 @@ fn isDefault(el: *Node.Element, frame: *Frame) bool {
     return form.getDefaultButton(frame) == el;
 }
 
+// The element under the mouse and its flat-tree ancestors are hovered. In an
+// ancestor document, the iframe holding the hovered element stands in for it.
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-hover
+fn isHovered(el: *Node.Element, frame: *Frame) bool {
+    var current: ?*Node = if (frame.page.input_hover_target) |target| target.asNode() else null;
+    while (current) |node| {
+        if (node == el.asNode()) {
+            return true;
+        }
+        if (node.flatTreeParent(frame)) |parent| {
+            current = parent;
+            continue;
+        }
+        const owner = node.ownerFrame(frame) orelse return false;
+        current = if (owner.iframe) |iframe| iframe.asNode() else null;
+    }
+    return false;
+}
+
 fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *Node, nth: ?*NthCache, frame: *Frame) bool {
     const node = el.asNode();
     switch (pseudo) {
@@ -673,7 +692,7 @@ fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *N
         .default => return isDefault(el, frame),
 
         // User interaction
-        .hover => return false,
+        .hover => return isHovered(el, frame),
         .active => return false,
         .focus => {
             const doc = node.ownerDocument(frame) orelse return false;
