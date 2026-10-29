@@ -701,3 +701,227 @@ test "cdp.runtime: only nodes have the node subtype, DOMExceptions are errors" {
         try testing.expectEqual(null, result.get("subtype"));
     }
 }
+
+// Probes bot-detection scripts use to learn whether a CDP client serializes
+// console arguments: each records into `detected` when the browser touches
+// it. With DevTools closed Chrome never does, so neither may we. Each runs on
+// its own, so the client can drain what it logged.
+const console_probes = [_][]const u8{
+    \\globalThis.detected = [];
+    \\globalThis.hit = (name) => detected.push(name);
+    \\{
+    \\    const e = new Error('boom');
+    \\    Object.defineProperty(e, 'stack', { get() { hit('stack'); return 'Error: boom'; }, configurable: true });
+    \\    for (const m of ['debug', 'log', 'info', 'warn', 'error', 'exception', 'dir', 'dirxml', 'trace', 'table', 'group', 'groupCollapsed']) console[m](e);
+    \\    console.assert(false, e);
+    \\}
+    ,
+    \\{
+    \\    const e = new TypeError();
+    \\    Object.defineProperty(e, 'message', { get() { hit('message'); return 'm'; } });
+    \\    Object.defineProperty(e, 'name', { get() { hit('name'); return 'n'; } });
+    \\    Object.defineProperty(e, 'cause', { get() { hit('cause'); return 'c'; } });
+    \\    console.log(e);
+    \\    class Custom extends Error { get name() { hit('Custom.name'); return 'Custom'; } }
+    \\    console.log(new Custom('x'));
+    \\    const proto = Object.create(Error.prototype, { message: { get() { hit('proto.message'); return 'p'; } } });
+    \\    const inherited = new Error();
+    \\    Object.setPrototypeOf(inherited, new Proxy(proto, { get(t, k, r) { hit('proto.proxy'); return Reflect.get(t, k, r); } }));
+    \\    console.log(inherited);
+    \\}
+    ,
+    // Reading `stack` formats it, which calls Error.prepareStackTrace; the
+    // page's own first read must still get to.
+    \\{
+    \\    const prepare = Error.prepareStackTrace;
+    \\    let own = false;
+    \\    Error.prepareStackTrace = (e, frames) => { if (!own) hit('prepareStackTrace'); return 'custom'; };
+    \\    console.log(new Error('fresh'));
+    \\    console.error(new RangeError('fresh'));
+    \\    console.trace('fresh');
+    \\    const lazy = new Error('lazy');
+    \\    console.log(lazy);
+    \\    own = true;
+    \\    if (lazy.stack !== 'custom') hit('stack.formatted');
+    \\    own = false;
+    \\    Error.prepareStackTrace = prepare;
+    \\}
+    ,
+    \\{
+    \\    const o = {};
+    \\    Object.defineProperty(o, 'id', { get() { hit('id'); return 1; }, enumerable: true });
+    \\    Object.defineProperty(o, Symbol.toStringTag, { get() { hit('toStringTag'); return 'T'; } });
+    \\    Object.defineProperty(o, 'constructor', { get() { hit('constructor'); return Object; } });
+    \\    console.log(o);
+    \\    console.log([o, [o]]);
+    \\    const div = document.createElement('div');
+    \\    Object.defineProperty(div, 'id', { get() { hit('div.id'); return 'x'; } });
+    \\    console.log(div);
+    \\    const arr = [1];
+    \\    Object.defineProperty(arr, 0, { get() { hit('arr[0]'); return 1; } });
+    \\    console.log(arr);
+    \\}
+    ,
+    \\{
+    \\    const traps = {};
+    \\    for (const t of ['get', 'set', 'has', 'ownKeys', 'getOwnPropertyDescriptor', 'getPrototypeOf', 'setPrototypeOf', 'defineProperty', 'deleteProperty', 'isExtensible', 'preventExtensions', 'apply', 'construct']) {
+    \\        traps[t] = (...args) => { hit('proxy.' + t); return Reflect[t](...args); };
+    \\    }
+    \\    const proxies = [new Proxy({}, traps), new Proxy([1, 2], traps), new Proxy(function f() {}, traps), new Proxy(new Error('p'), traps)];
+    \\    for (const p of proxies) { console.log(p); console.dir(p); console.error(p); console.log([p]); console.log(Object.create(p)); }
+    \\}
+    ,
+    \\{
+    \\    const prim = {
+    \\        toString() { hit('toString'); return 's'; },
+    \\        valueOf() { hit('valueOf'); return 1; },
+    \\        toJSON() { hit('toJSON'); return 1; },
+    \\        [Symbol.toPrimitive]() { hit('toPrimitive'); return 'p'; },
+    \\    };
+    \\    console.log(prim);
+    \\    console.log('%s %d %i %f %o %O %c', prim, prim, prim, prim, prim, prim, prim);
+    \\    console.log([prim]);
+    \\    const date = new Date(0);
+    \\    date[Symbol.toPrimitive] = () => { hit('date.toPrimitive'); return 'd'; };
+    \\    date.toISOString = () => { hit('date.toISOString'); return 'd'; };
+    \\    console.log(date);
+    \\    const fn = function probe() {};
+    \\    fn.toString = () => { hit('fn.toString'); return 'f'; };
+    \\    console.log(fn);
+    \\    console.log(new Number(1), new String('s'), Object(Symbol('y')));
+    \\}
+    ,
+    \\console.log(new RangeError('described'));
+    \\console.log('primitives', 42, 1.5, true, false, null, undefined);
+};
+
+// Runs the probes in the page, asserts none fired, and that the console
+// messages still reached the client with their primitive values.
+fn expectConsoleUndetected(ctx: *testing.TestContext, bc: *CDP.BrowserContext, runtime: bool, console: bool) !void {
+    const frame = bc.mainFrame() orelse unreachable;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    for (console_probes) |probe| {
+        _ = try ls.local.exec(probe, "probe.js");
+        _ = try ctx.getSentMessage(std.math.maxInt(usize));
+    }
+    const detected = try ls.local.exec("detected.join(',')", null);
+    try testing.expectEqual("", try detected.toStringSlice());
+
+    if (runtime) {
+        try ctx.expectSentEvent("Runtime.consoleAPICalled", .{ .type = "log", .args = .{
+            .{ .type = "string", .value = "primitives" },
+            .{ .type = "number", .value = 42 },
+            .{ .type = "number", .value = 1.5 },
+            .{ .type = "boolean", .value = true },
+            .{ .type = "boolean", .value = false },
+            .{ .type = "object", .subtype = "null", .value = null },
+            .{ .type = "undefined" },
+        } }, .{});
+        try ctx.expectSentEvent("Runtime.consoleAPICalled", .{ .type = "debug", .args = .{
+            .{ .type = "object", .subtype = "error", .className = "Error", .description = "Error: boom\n    at probe.js:4:15" },
+        } }, .{});
+        // An error still has a handle, and is described like Chrome does.
+        try ctx.expectSentEvent("Runtime.consoleAPICalled", .{ .type = "log", .args = .{
+            .{ .type = "object", .subtype = "error", .className = "RangeError", .description = "RangeError: described\n    at probe.js:1:13" },
+        } }, .{});
+        var handles: usize = 0;
+        for (ctx.received.items) |msg| {
+            const params = msg.object.get("params") orelse continue;
+            const args = (params.object.get("args") orelse continue).array.items;
+            if (args.len == 1 and args[0].object.contains("objectId")) {
+                handles += 1;
+            }
+        }
+        try testing.expect(handles > 0);
+    }
+    if (console) {
+        try ctx.expectSentEvent("Console.messageAdded", .{ .level = "log", .text = "primitives 42 1.5 true false null undefined" }, .{});
+        try ctx.expectSentEvent("Console.messageAdded", .{ .level = "debug", .text = "Error: boom" }, .{});
+    }
+}
+
+fn discardLog(_: []const u8) void {}
+
+test "cdp.runtime: console probes stay undetected without any domain enabled" {
+    // Every console line gets formatted, in both log formats.
+    const log = @import("lightpanda").log;
+    const opts = log.opts;
+    defer log.opts = opts;
+    defer log.sink = null;
+    log.sink = discardLog;
+    log.opts.level = .debug;
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PRB0", .url = "hi.html", .target_id = "FID-000000PRB0".* });
+
+    log.opts.format = .logfmt;
+    try expectConsoleUndetected(&ctx, bc, false, false);
+    log.opts.format = .pretty;
+    try expectConsoleUndetected(&ctx, bc, false, false);
+}
+
+test "cdp.runtime: console probes stay undetected after Runtime.enable" {
+    testing.silenceLog(&.{.js});
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PRB1", .url = "hi.html", .target_id = "FID-000000PRB1".* });
+    try ctx.processMessage(.{ .id = 80, .method = "Runtime.enable" });
+    try expectConsoleUndetected(&ctx, bc, true, false);
+}
+
+test "cdp.runtime: console probes stay undetected after Console.enable and Log.enable" {
+    testing.silenceLog(&.{.js});
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PRB2", .url = "hi.html", .target_id = "FID-000000PRB2".* });
+    try ctx.processMessage(.{ .id = 81, .method = "Console.enable" });
+    try ctx.processMessage(.{ .id = 82, .method = "Log.enable" });
+    try expectConsoleUndetected(&ctx, bc, false, true);
+}
+
+test "cdp.runtime: Runtime.enable leaves no trace a page can see" {
+    testing.silenceLog(&.{.js});
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PRB4", .url = "hi.html", .target_id = "FID-000000PRB4".* });
+
+    const frame = bc.mainFrame() orelse unreachable;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    // Globals, the stack-trace hooks, and the shape of a stack.
+    const fingerprint =
+        \\JSON.stringify([
+        \\    Object.getOwnPropertyNames(globalThis).sort(),
+        \\    typeof Error.prepareStackTrace, Error.stackTraceLimit,
+        \\    Object.getOwnPropertyNames(Error).sort(),
+        \\    typeof Error.captureStackTrace,
+        \\    (function f() { return new Error('x').stack; })().split('\n').length,
+        \\    Object.getOwnPropertyNames(console).sort(),
+        \\])
+    ;
+    const before = try (try ls.local.exec(fingerprint, null)).toStringSlice();
+    try ctx.processMessage(.{ .id = 86, .method = "Runtime.enable" });
+    try ctx.processMessage(.{ .id = 87, .method = "Console.enable" });
+    try ctx.processMessage(.{ .id = 88, .method = "Log.enable" });
+    const after = try (try ls.local.exec(fingerprint, null)).toStringSlice();
+    try testing.expectEqual(before, after);
+    try testing.expectEqual("undefined", try (try ls.local.exec("typeof Error.prepareStackTrace", null)).toStringSlice());
+    try testing.expectEqual(10, try (try ls.local.exec("Error.stackTraceLimit", null)).toI32());
+}
+
+test "cdp.runtime: console probes stay undetected with every domain enabled" {
+    testing.silenceLog(&.{.js});
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PRB3", .url = "hi.html", .target_id = "FID-000000PRB3".* });
+    try ctx.processMessage(.{ .id = 83, .method = "Runtime.enable" });
+    try ctx.processMessage(.{ .id = 84, .method = "Console.enable" });
+    try ctx.processMessage(.{ .id = 85, .method = "Log.enable" });
+    try expectConsoleUndetected(&ctx, bc, true, true);
+}

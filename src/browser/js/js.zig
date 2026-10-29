@@ -523,6 +523,10 @@ pub export fn v8_inspector__Client__IMPL__valueSubtype(
     _: *v8.InspectorClientImpl,
     c_value: *const v8.Value,
 ) callconv(.c) [*c]const u8 {
+    // Claimed so that V8 asks us for the description, see below.
+    if (v8.v8__Value__IsNativeError(c_value)) {
+        return "error";
+    }
     const tao = Inspector.getTaggedOpaque(c_value) orelse return null;
     return if (inspectorSubtype(tao)) |st| @tagName(st) else null;
 }
@@ -536,16 +540,148 @@ pub export fn v8_inspector__Client__IMPL__descriptionForValueSubtype(
     v8_context: *const v8.Context,
     c_value: *const v8.Value,
 ) callconv(.c) [*c]const u8 {
-    _ = v8_context;
-
     // Without a description, V8 drops the subtype, except for "error": it
-    // then describes the value itself ("name: message", plus the stack).
+    // then describes the value itself. But V8's descriptionForError Gets the
+    // `name`, `message` and `stack` properties, running the page's getters
+    // (and Proxy traps on the prototype chain), and reading `stack` formats
+    // it, calling Error.prepareStackTrace then instead of on the page's own
+    // first read. A page can see all of that, and Chrome only does it with
+    // DevTools open, so errors are described here without running any JS.
+    if (v8.v8__Value__IsNativeError(c_value)) {
+        var w: std.Io.Writer = .fixed(description_buf[0 .. description_buf.len - 1]);
+        writeErrorDescription(v8_context, @ptrCast(c_value), &w) catch {};
+        return terminateDescription(w.buffered().len);
+    }
+
     const tao = Inspector.getTaggedOpaque(c_value) orelse return null;
     const subtype = inspectorSubtype(tao) orelse return null;
     if (subtype == .@"error") {
-        return null;
+        const DOMException = @import("../webapi/DOMException.zig");
+        const exception = tao.as(DOMException) orelse return null;
+        var w: std.Io.Writer = .fixed(description_buf[0 .. description_buf.len - 1]);
+        writeDescriptionText(exception.getName(), &w) catch {};
+        const message = exception.getMessage();
+        if (message.len > 0) {
+            w.writeAll(": ") catch {};
+            writeDescriptionText(message, &w) catch {};
+        }
+        return terminateDescription(w.buffered().len);
     }
     return "";
+}
+
+// V8 copies the description out right away.
+threadlocal var description_buf: [16 * 1024]u8 = undefined;
+
+fn terminateDescription(len: usize) [*c]const u8 {
+    description_buf[len] = 0;
+    return &description_buf;
+}
+
+// The binding hands V8 the description as an 8-bit string, which the
+// inspector reads as Latin-1, and stops at the first NUL.
+fn writeDescriptionText(utf8: []const u8, w: *std.Io.Writer) !void {
+    if (std.unicode.utf8ValidateSlice(utf8) == false) {
+        for (utf8) |b| {
+            try w.writeByte(if (b == 0 or b >= 0x80) '?' else b);
+        }
+        return;
+    }
+    var it = std.unicode.Utf8View.initUnchecked(utf8).iterator();
+    while (it.nextCodepoint()) |cp| {
+        try w.writeByte(if (cp == 0) ' ' else if (cp > 0xff) '?' else @intCast(cp));
+    }
+}
+
+fn writeDescriptionString(isolate: *v8.Isolate, str: *const v8.String, w: *std.Io.Writer) !void {
+    var buf: [4096]u8 = undefined;
+    const n = v8.v8__String__WriteUtf8(str, isolate, &buf, buf.len, v8.WRITE_REPLACE_INVALID_UTF8, null);
+    return writeDescriptionText(buf[0..n], w);
+}
+
+// What V8's descriptionForError builds, "<name>: <message>" and the stack's
+// frames, from data properties and the frames captured with the error.
+fn writeErrorDescription(v8_context: *const v8.Context, object: *const v8.Object, w: *std.Io.Writer) !void {
+    const isolate = v8.v8__Isolate__GetCurrent().?;
+    var hs: HandleScope = undefined;
+    hs.initWithIsolateHandle(isolate);
+    defer hs.deinit();
+
+    var name: *const v8.String = v8.v8__Object__GetConstructorName(object).?;
+    if (errorDataProperty(isolate, v8_context, object, "name")) |value| {
+        if (v8.v8__Value__IsString(value)) {
+            const str: *const v8.String = @ptrCast(value);
+            var buf: [6]u8 = undefined;
+            const n = v8.v8__String__WriteUtf8(str, isolate, &buf, buf.len, v8.WRITE_REPLACE_INVALID_UTF8, null);
+            if (n > 0 and !std.mem.eql(u8, buf[0..n], "Error")) {
+                name = str;
+            }
+        }
+    }
+    try writeDescriptionString(isolate, name, w);
+
+    if (errorDataProperty(isolate, v8_context, object, "message")) |value| {
+        if (v8.v8__Value__IsString(value) and v8.v8__String__Length(@ptrCast(value)) > 0) {
+            try w.writeAll(": ");
+            try writeDescriptionString(isolate, @ptrCast(value), w);
+        }
+    }
+
+    // Only captured while the inspector wants stacks (Runtime.enable).
+    const stack = v8.v8__Exception__GetStackTrace(@ptrCast(object)) orelse return;
+    // Error.stackTraceLimit's default.
+    const frame_count: u32 = @min(@as(u32, @intCast(v8.v8__StackTrace__GetFrameCount(stack))), 10);
+    for (0..frame_count) |i| {
+        const frame = v8.v8__StackTrace__GetFrame(stack, isolate, @intCast(i)).?;
+        try w.writeAll("\n    at ");
+        const function = v8.v8__StackFrame__GetFunctionName(frame);
+        const has_function = if (function) |f| v8.v8__String__Length(f) > 0 else false;
+        if (has_function) {
+            if (v8.v8__StackFrame__IsConstructor(frame)) {
+                try w.writeAll("new ");
+            }
+            try writeDescriptionString(isolate, function.?, w);
+            try w.writeAll(" (");
+        }
+        if (v8.v8__StackFrame__GetScriptNameOrSourceURL(frame)) |script| {
+            try writeDescriptionString(isolate, script, w);
+        } else {
+            try w.writeAll("<anonymous>");
+        }
+        try w.print(":{d}:{d}", .{ v8.v8__StackFrame__GetLineNumber(frame), v8.v8__StackFrame__GetColumn(frame) });
+        if (has_function) {
+            try w.writeByte(')');
+        }
+    }
+}
+
+// The value of `key` when it's a data property of `object` or of a prototype.
+// Null on an accessor or a Proxy, which would run page JS.
+fn errorDataProperty(isolate: *v8.Isolate, v8_context: *const v8.Context, object: *const v8.Object, key: []const u8) ?*const v8.Value {
+    const key_handle = v8.v8__String__NewFromUtf8(isolate, key.ptr, v8.kNormal, @intCast(key.len)) orelse return null;
+    const value_key = v8.v8__String__NewFromUtf8(isolate, "value", v8.kNormal, 5) orelse return null;
+
+    var current = object;
+    for (0..32) |_| {
+        if (v8.v8__Value__IsProxy(@ptrCast(current))) {
+            return null;
+        }
+        const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(current, v8_context, @ptrCast(key_handle)) orelse return null;
+        if (v8.v8__Value__IsObject(descriptor)) {
+            var has: v8.MaybeBool = undefined;
+            v8.v8__Object__HasOwnProperty(@ptrCast(descriptor), v8_context, @ptrCast(value_key), &has);
+            if (has.has_value == false or has.value == false) {
+                return null;
+            }
+            return v8.v8__Object__Get(@ptrCast(descriptor), v8_context, @ptrCast(value_key));
+        }
+        const proto = v8.v8__Object__GetPrototype(current) orelse return null;
+        if (v8.v8__Value__IsObject(proto) == false) {
+            return null;
+        }
+        current = @ptrCast(proto);
+    }
+    return null;
 }
 
 // The subtype the inspector reports for one of our objects, as Chrome does:
