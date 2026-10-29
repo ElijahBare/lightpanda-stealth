@@ -28,6 +28,8 @@ const log = lp.log;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
+        enable,
+        disable,
         setEmulatedMedia,
         setFocusEmulationEnabled,
         setDeviceMetricsOverride,
@@ -43,6 +45,9 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
+        // Not in Chrome's protocol, but clients that enable every domain
+        // they listen on send them; nothing is gated on them here.
+        .enable, .disable => return cmd.sendResult(null, .{}),
         .setEmulatedMedia => return setEmulatedMedia(cmd),
         .setFocusEmulationEnabled => return setFocusEmulationEnabled(cmd),
         .setDeviceMetricsOverride => return setDeviceMetricsOverride(cmd),

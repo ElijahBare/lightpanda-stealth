@@ -1687,6 +1687,49 @@ test "cdp: invalid json" {
     try ctx.expectSentError(-32601, "'Target.over9000' wasn't found", .{});
 }
 
+// Clients like zendriver send <Domain>.enable for every domain whose events
+// they listen on, and <Domain>.disable once they stop: each routed domain
+// must answer both.
+test "cdp: every domain answers enable and disable" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-EN", .session_id = "SID-X", .url = "hi.html" });
+
+    const domains = [_][]const u8{
+        "LP",        "IO",        "DOM",         "Log",           "CSS",      "Page",
+        "Fetch",     "Input",     "Target",      "Audits",        "WebMCP",   "Browser",
+        "Runtime",   "Network",   "Storage",     "Console",       "Security", "Debugger",
+        "Emulation", "Inspector", "Performance", "Accessibility",
+    };
+
+    // Lacking in files other work is changing; drop an entry once it lands.
+    const missing = [_][]const u8{ "DOM.disable", "Input.enable", "Input.disable", "Browser.enable", "Browser.disable" };
+
+    var id: usize = 100;
+    for (domains) |domain| {
+        for ([_][]const u8{ "enable", "disable" }) |action| {
+            id += 1;
+            const method = try std.fmt.allocPrint(testing.arena_allocator, "{s}.{s}", .{ domain, action });
+            try ctx.processMessage(.{ .id = id, .method = method, .sessionId = "SID-X" });
+
+            const is_missing = for (missing) |m| {
+                if (std.mem.eql(u8, m, method)) break true;
+            } else false;
+
+            if (is_missing) {
+                const msg = try std.fmt.allocPrint(testing.arena_allocator, "'{s}' wasn't found", .{method});
+                try ctx.expectSentError(-32601, msg, .{ .id = id });
+            } else {
+                ctx.expectSentResult(null, .{ .id = id, .session_id = "SID-X" }) catch |err| {
+                    std.debug.print("{s} failed\n", .{method});
+                    return err;
+                };
+            }
+        }
+    }
+}
+
 test "cdp: invalid sessionId" {
     var ctx = try testing.context();
     defer ctx.deinit();

@@ -29,6 +29,8 @@ const log = lp.log;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
+        enable,
+        disable,
         getTargets,
         attachToTarget,
         attachToBrowserTarget,
@@ -46,6 +48,10 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
+        // Not in Chrome's protocol (events are driven by setDiscoverTargets
+        // and setAutoAttach), but clients that enable every domain they
+        // listen on send them.
+        .enable, .disable => return cmd.sendResult(null, .{}),
         .getTargets => return getTargets(cmd),
         .attachToTarget => return attachToTarget(cmd),
         .attachToBrowserTarget => return attachToBrowserTarget(cmd),

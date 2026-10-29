@@ -38,6 +38,7 @@ const Allocator = std.mem.Allocator;
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         enable,
+        disable,
         getFrameTree,
         getNavigationHistory,
         setLifecycleEventsEnabled,
@@ -59,7 +60,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
-        .enable => return cmd.sendResult(null, .{}),
+        .enable, .disable => return cmd.sendResult(null, .{}),
         .getFrameTree => return getFrameTree(cmd),
         .getNavigationHistory => return getNavigationHistory(cmd),
         .setLifecycleEventsEnabled => return setLifecycleEventsEnabled(cmd),
@@ -3009,6 +3010,41 @@ test "cdp.frame: addScriptToEvaluateOnNewDocument" {
         const test_val = try ls.local.exec("window.__test2", null);
         try testing.expectEqual(2, try test_val.toI32());
     }
+}
+
+// zendriver's "expert" mode registers this exact script so that closed
+// shadow roots are reachable from automation.
+test "cdp.frame: addScriptToEvaluateOnNewDocument attachShadow shim opens closed roots" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-SH", .url = "hi.html", .target_id = "FID-00000000SH".* });
+
+    try ctx.processMessage(.{ .id = 20, .method = "Page.addScriptToEvaluateOnNewDocument", .params = .{
+        .source =
+        \\Element.prototype._attachShadow = Element.prototype.attachShadow;
+        \\Element.prototype.attachShadow = function () {
+        \\    return this._attachShadow( { mode: "open" } );
+        \\};
+        ,
+    } });
+    try ctx.expectSentResult(.{ .identifier = "1" }, .{ .id = 20 });
+
+    try ctx.processMessage(.{ .id = 21, .method = "Page.navigate", .params = .{
+        .url = "http://127.0.0.1:9582/src/browser/tests/cdp/shadow_dom.html",
+    } });
+    try testing.waitForPage(bc);
+
+    const frame = bc.mainFrame() orelse unreachable;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const v = try ls.local.exec(
+        \\const root = document.getElementById('closed-host').shadowRoot;
+        \\root !== null && root.mode === 'open' && root.getElementById('in-closed') !== null
+    , null);
+    try testing.expect(v.toBool());
 }
 
 test "cdp.frame: navigateToHistoryEntry restores an entry of the same document in place" {

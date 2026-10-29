@@ -22,9 +22,10 @@ const CDP = @import("../CDP.zig");
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         enable,
+        disable,
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
-        .enable => return cmd.sendResult(null, .{}),
+        .enable, .disable => return cmd.sendResult(null, .{}),
     }
 }

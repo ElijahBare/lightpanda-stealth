@@ -934,7 +934,14 @@ fn isValidShadowHost(self: *const Element) bool {
     };
 }
 
-pub fn attachShadow(self: *Element, opts: ShadowRoot.AttachOptions, frame: *Frame) !*ShadowRoot {
+pub fn attachShadow(self: *Element, requested: ShadowRoot.AttachOptions, frame: *Frame) !*ShadowRoot {
+    var opts = requested;
+    // --force-open-shadow-roots: closed roots become reachable through
+    // element.shadowRoot without patching attachShadow from JS.
+    if (frame.page.session.force_open_shadow_roots) {
+        opts.mode = .open;
+    }
+
     if (!self.isValidShadowHost()) {
         return error.NotSupported;
     }

@@ -475,6 +475,11 @@
     \\          Enable an experimental, unstable feature. Can be passed multiple times.
     \\          Behavior may change or be removed without notice.
     \\          Defaults to none enabled.
+    \\  --force-open-shadow-roots
+    \\          Attach every shadow root as open, even when the page asks for a
+    \\          closed one, so automation can reach it through element.shadowRoot.
+    \\          Element.attachShadow itself stays native.
+    \\          Defaults to false.
     \\  --load-resources <RESOURCE>
     \\          Sub-resource to actually request. Can be passed multiple times.
     \\          Defaults to stylesheet for mcp and agent, and to none of them
