@@ -41,6 +41,7 @@ const Allocator = std.mem.Allocator;
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
         enable,
+        disable,
         getDocument,
         performSearch,
         getSearchResults,
@@ -58,10 +59,14 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         requestNode,
         setFileInputFiles,
         focus,
+        removeNode,
+        setNodeValue,
+        setOuterHTML,
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
         .enable => return cmd.sendResult(null, .{}),
+        .disable => return cmd.sendResult(null, .{}),
         .getDocument => return getDocument(cmd),
         .performSearch => return performSearch(cmd),
         .getSearchResults => return getSearchResults(cmd),
@@ -79,6 +84,9 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .requestNode => return requestNode(cmd),
         .setFileInputFiles => return setFileInputFiles(cmd),
         .focus => return focus(cmd),
+        .removeNode => return removeNode(cmd),
+        .setNodeValue => return setNodeValue(cmd),
+        .setOuterHTML => return setOuterHTML(cmd),
     }
 }
 
@@ -722,6 +730,67 @@ fn focus(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
+// https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-removeNode
+fn removeNode(cmd: *CDP.Command) !void {
+    const params = (try cmd.params(struct {
+        nodeId: NodeRegistry.Id,
+    })) orelse return error.InvalidParams;
+
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const root = bc.mainFrame() orelse return error.FrameNotLoaded;
+
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, null, null);
+    const parent = node.dom.parentNode() orelse {
+        return cmd.sendError(-32000, "Cannot remove detached node", .{});
+    };
+    // Mutation bookkeeping belongs to the frame owning the node's document.
+    const frame = node.dom.ownerFrame(root) orelse return error.InvalidNodeId;
+    _ = try parent.removeChild(node.dom, frame);
+
+    return cmd.sendResult(null, .{});
+}
+
+// https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-setNodeValue
+fn setNodeValue(cmd: *CDP.Command) !void {
+    const params = (try cmd.params(struct {
+        nodeId: NodeRegistry.Id,
+        value: []const u8,
+    })) orelse return error.InvalidParams;
+
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const root = bc.mainFrame() orelse return error.FrameNotLoaded;
+
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, null, null);
+    // Like Chrome, only text nodes accept a value.
+    if (node.dom.is(DOMNode.CData.Text) == null) {
+        return cmd.sendError(-32000, "Can only set value of text nodes", .{});
+    }
+    const frame = node.dom.ownerFrame(root) orelse return error.InvalidNodeId;
+    // replaceData copies the bytes, so the command arena is enough.
+    const value = try lp.String.init(cmd.arena, params.value, .{});
+    try node.dom.setNodeValue(value, frame);
+
+    return cmd.sendResult(null, .{});
+}
+
+// https://chromedevtools.github.io/devtools-protocol/tot/DOM/#method-setOuterHTML
+fn setOuterHTML(cmd: *CDP.Command) !void {
+    const params = (try cmd.params(struct {
+        nodeId: NodeRegistry.Id,
+        outerHTML: []const u8,
+    })) orelse return error.InvalidParams;
+
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const root = bc.mainFrame() orelse return error.FrameNotLoaded;
+
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, null, null);
+    const element = node.dom.is(DOMNode.Element) orelse return error.NodeIsNotAnElement;
+    const frame = element.ownerFrame(root) orelse return error.InvalidNodeId;
+    try element.setOuterHTML(params.outerHTML, frame);
+
+    return cmd.sendResult(null, .{});
+}
+
 fn fileFromDiskPath(path: []const u8, page: *Page) !*File {
     // Mirror File.init: a Blob and File sharing one reference-counted arena,
     // but read the bytes straight off disk into it (single copy, no JS parts).
@@ -1003,6 +1072,94 @@ test "cdp.dom: focus errors on an element that can't take focus" {
 
     const result = try ls.local.compileAndRun("document.activeElement === document.body", null);
     try testing.expect(result.isTrue());
+}
+
+test "cdp.dom: disable" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    try ctx.processMessage(.{ .id = 1, .method = "DOM.disable" });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+}
+
+test "cdp.dom: removeNode detaches the node from its parent" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "mcp_actions.html" });
+    const frame = bc.mainFrame().?;
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    try ctx.processMessage(.{ .id = 1, .method = "DOM.performSearch", .params = .{ .query = "#btn" } });
+    try ctx.expectSentResult(.{ .searchId = "0", .resultCount = 1 }, .{ .id = 1 });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "DOM.getSearchResults",
+        .params = .{ .searchId = "0", .fromIndex = 0, .toIndex = 1 },
+    });
+    try ctx.expectSentResult(.{ .nodeIds = &.{1} }, .{ .id = 2 });
+
+    try ctx.processMessage(.{ .id = 3, .method = "DOM.removeNode", .params = .{ .nodeId = 1 } });
+    try ctx.expectSentResult(null, .{ .id = 3 });
+    try testing.expect((try ls.local.compileAndRun("document.getElementById('btn') === null", null)).isTrue());
+
+    // Now detached: a second removal has no parent to remove it from.
+    try ctx.processMessage(.{ .id = 4, .method = "DOM.removeNode", .params = .{ .nodeId = 1 } });
+    try ctx.expectSentError(-32000, "Cannot remove detached node", .{ .id = 4 });
+}
+
+test "cdp.dom: setNodeValue replaces a text node's data" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "mcp_actions.html" });
+    const frame = bc.mainFrame().?;
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const btn = frame.window._document.getElementById("btn").?.asNode();
+    const text = btn.firstChild().?;
+    const text_node = try bc.node_registry.register(text);
+    const btn_node = try bc.node_registry.register(btn);
+
+    try ctx.processMessage(.{ .id = 1, .method = "DOM.setNodeValue", .params = .{ .nodeId = text_node.id, .value = "a much longer replacement value" } });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try testing.expect((try ls.local.compileAndRun("document.getElementById('btn').textContent === 'a much longer replacement value'", null)).isTrue());
+
+    try ctx.processMessage(.{ .id = 2, .method = "DOM.setNodeValue", .params = .{ .nodeId = btn_node.id, .value = "nope" } });
+    try ctx.expectSentError(-32000, "Can only set value of text nodes", .{ .id = 2 });
+}
+
+test "cdp.dom: setOuterHTML replaces the element" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "mcp_actions.html" });
+    const frame = bc.mainFrame().?;
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const btn = frame.window._document.getElementById("btn").?.asNode();
+    const btn_node = try bc.node_registry.register(btn);
+    const text_node = try bc.node_registry.register(btn.firstChild().?);
+
+    try ctx.processMessage(.{ .id = 1, .method = "DOM.setOuterHTML", .params = .{ .nodeId = btn_node.id, .outerHTML = "<span id=\"swapped\">hi</span><b>there</b>" } });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try testing.expect((try ls.local.compileAndRun(
+        \\document.getElementById('btn') === null &&
+        \\document.getElementById('swapped').textContent === 'hi' &&
+        \\document.getElementById('swapped').nextSibling.outerHTML === '<b>there</b>'
+    , null)).isTrue());
+
+    try ctx.processMessage(.{ .id = 2, .method = "DOM.setOuterHTML", .params = .{ .nodeId = text_node.id, .outerHTML = "<p></p>" } });
+    try ctx.expectSentError(-31998, "NodeIsNotAnElement", .{ .id = 2 });
 }
 
 test "cdp.dom: setFileInputFiles on file input" {
