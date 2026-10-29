@@ -223,6 +223,10 @@ fn tick(self: *const Driver) !bool {
         return false;
     }
 
+    if (self.closeRequested()) {
+        return false;
+    }
+
     // Liveness is enforced by TCP keepalive configured in
     // Server.configureSocket; the wakeup lets V8 run or terminate.
     const wait_ms: u32 = 1000; // 1s
@@ -233,7 +237,7 @@ fn tick(self: *const Driver) !bool {
             error.ClientDisconnected => return false,
             else => return err,
         };
-        return true;
+        return self.closeRequested() == false;
     }
 
     // No active page yet (or a teardown is in flight). Fall back to ticking
@@ -245,7 +249,26 @@ fn tick(self: *const Driver) !bool {
             return false;
         },
     };
-    return true;
+    return self.closeRequested() == false;
+}
+
+// Worker thread. The client asked us to close its connection (CDP
+// Browser.close). Its result is already written (Link.send is synchronous);
+// follow it with a normal close frame. Returns true when the worker is done.
+fn closeRequested(self: *const Driver) bool {
+    switch (self.impl) {
+        .cdp => |cdp| {
+            if (cdp.closing == false) {
+                return false;
+            }
+            log.info(self.scope, "closing connection", .{ .reason = "Browser.close" });
+            cdp.link.send(&WS.CLOSE_NORMAL) catch |err| {
+                log.debug(self.scope, "browser close", .{ .err = err });
+            };
+            return true;
+        },
+        .bidi => return false,
+    }
 }
 
 const PageWait = struct {

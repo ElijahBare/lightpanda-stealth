@@ -46,6 +46,7 @@ const DEV_TOOLS_WINDOW_ID = 1923710101;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
+        close,
         getVersion,
         setPermission,
         setWindowBounds,
@@ -56,6 +57,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
+        .close => return close(cmd),
         .getVersion => return getVersion(cmd),
         .setPermission => return setPermission(cmd),
         .setWindowBounds => return setWindowBounds(cmd),
@@ -64,6 +66,25 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .getWindowForTarget => return getWindowForTarget(cmd),
         .setDownloadBehavior => return setDownloadBehavior(cmd),
     }
+}
+
+// https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-close
+// The server is long-lived and may serve other clients, so rather than
+// exiting we end this client's session: reply, tear down its browser
+// context (as Target.disposeBrowserContext does), and let the worker send
+// a close frame and drop the connection on its next tick.
+fn close(cmd: *CDP.Command) !void {
+    const cdp = cmd.cdp;
+    // Link.send writes synchronously, so the result is on the wire before
+    // the close frame follows.
+    try cmd.sendResult(null, .{});
+    if (cdp.browser_context) |*bc| {
+        bc.closeTarget() catch |err| {
+            log.debug(.cdp, "browser close target", .{ .err = err });
+        };
+        cdp.disposeBrowserContext();
+    }
+    cdp.closing = true;
 }
 
 fn getVersion(cmd: *CDP.Command) !void {
@@ -249,6 +270,7 @@ fn resetPermissions(cmd: *CDP.Command) !void {
 }
 
 const testing = @import("../testing.zig");
+const WS = @import("../../WS.zig");
 test "cdp.browser: getVersion" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -777,4 +799,34 @@ test "cdp.browser: detaching the download session resets the download behavior" 
     try testing.expect(bc.download_session_id == null);
     try testing.expectEqual(.deny, bc.session.download_behavior);
     try testing.expectEqual(false, bc.session.download_events_enabled);
+}
+
+test "cdp.browser: close replies, disposes the context and marks the connection closing" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-C", .session_id = "SID-C", .url = "cdp/download_link.html" });
+
+    try ctx.processMessage(.{ .id = 60, .method = "Browser.close" });
+    try ctx.expectSentResult(null, .{ .id = 60 });
+    try ctx.expectSentEvent("Target.targetDestroyed", .{ .targetId = "TID-000000000Z" }, .{});
+
+    const cdp = ctx.cdp();
+    try testing.expect(cdp.browser_context == null);
+    try testing.expectEqual(true, cdp.closing);
+
+    // The worker's next tick ends the connection with a normal close frame.
+    ctx.driver.run();
+    var buf: [WS.CLOSE_NORMAL.len]u8 = undefined;
+    const n = try std.posix.read(ctx.socket, &buf);
+    try testing.expectEqualSlices(u8, &WS.CLOSE_NORMAL, buf[0..n]);
+}
+
+test "cdp.browser: close without a browser context" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    try ctx.processMessage(.{ .id = 62, .method = "Browser.close" });
+    try ctx.expectSentResult(null, .{ .id = 62 });
+    try testing.expectEqual(true, ctx.cdp().closing);
 }
