@@ -31,6 +31,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         dispatchTouchEvent,
         insertText,
         setInterceptDrags,
+        synthesizeScrollGesture,
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
@@ -40,6 +41,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .dispatchTouchEvent => return dispatchTouchEvent(cmd),
         .insertText => return insertText(cmd),
         .setInterceptDrags => return setInterceptDrags(cmd),
+        .synthesizeScrollGesture => return synthesizeScrollGesture(cmd),
     }
 }
 
@@ -272,6 +274,39 @@ fn setInterceptDrags(cmd: *CDP.Command) !void {
     }
     try cmd.sendResult(null, .{});
 }
+
+/// https://chromedevtools.github.io/devtools-protocol/tot/Input/#method-synthesizeScrollGesture
+///
+/// Replayed as one wheel per gesture over (x, y), so the page gets its
+/// `wheel` and `scroll` events and the scroll latches as a mouse wheel would.
+/// A gesture's distance is the finger's travel, the opposite of the content's:
+/// a negative yDistance scrolls down. Chrome animates the gesture at `speed`
+/// and waits `repeatDelayMs` between repeats; we apply each at once, and reply
+/// once all of them are applied. Overscroll, fling and the gesture source have
+/// nothing to act on here.
+fn synthesizeScrollGesture(cmd: *CDP.Command) !void {
+    const params = (try cmd.params(struct {
+        x: f64,
+        y: f64,
+        xDistance: f64 = 0,
+        yDistance: f64 = 0,
+        repeatCount: u32 = 0,
+        // xOverscroll, yOverscroll, preventFling, speed, gestureSourceType,
+        // repeatDelayMs and interactionMarkerName are accepted and ignored.
+    })) orelse return error.InvalidParams;
+
+    const bc = cmd.browser_context orelse return cmd.sendResult(null, .{});
+    const frame = bc.mainFrame() orelse return cmd.sendResult(null, .{});
+
+    // Each repeat runs synchronously on the CDP thread, so bound them.
+    const gestures = @min(params.repeatCount, max_scroll_gesture_repeats) + 1;
+    for (0..gestures) |_| {
+        try Frame.user_input.triggerMouseWheel(frame, params.x, params.y, -params.xDistance, -params.yDistance);
+    }
+    try cmd.sendResult(null, .{});
+}
+
+const max_scroll_gesture_repeats = 1000;
 
 fn cdpModifiers(bits: u4) Frame.user_input.Modifiers {
     return .{
@@ -924,6 +959,70 @@ test "cdp.input: dispatchMouseEvent mouseWheel on page content scrolls the viewp
         .params = .{ .type = "mouseWheel", .x = 100_000, .y = 100_000, .deltaY = 100 },
     });
     result = try ls.local.compileAndRun("window.scrollY === 500", null);
+    try testing.expect(result.isTrue());
+}
+
+test "cdp.input: synthesizeScrollGesture scrolls the viewport and fires wheel and scroll" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    // A tall page with no inner scroll container: each repeat is hit-tested
+    // anew, and the fixture's boxes would latch some of them once it scrolls.
+    _ = try ls.local.compileAndRun(
+        \\document.body.innerHTML = '<div style="height: 10000px; width: 10000px"></div>';
+        \\window.wheels = [];
+        \\window.addEventListener('wheel', (e) => window.wheels.push(e.deltaY));
+        \\window.addEventListener('scroll', () => { window.winScrolled = true; });
+    , null);
+
+    // Zendriver's scroll_down: a negative yDistance from (0, 0) moves the
+    // content down, as a finger dragging up would.
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.synthesizeScrollGesture",
+        .params = .{ .x = 0, .y = 0, .yDistance = -300, .xOverscroll = 0, .yOverscroll = 0, .preventFling = true, .repeatDelayMs = 0, .speed = 800 },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    var result = try ls.local.compileAndRun("window.scrollY === 300 && window.scrollX === 0 && window.wheels.join() === '300'", null);
+    try testing.expect(result.isTrue());
+
+    var runner = bc.session.runner(.{});
+    try runner.waitForScript(frame._frame_id, "window.winScrolled === true", 1000);
+
+    // repeatCount replays the gesture on top of the first one.
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.synthesizeScrollGesture",
+        .params = .{ .x = 0, .y = 0, .xDistance = -10, .yDistance = -100, .repeatCount = 2 },
+    });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    result = try ls.local.compileAndRun("window.scrollY === 600 && window.scrollX === 30 && window.wheels.join() === '300,100,100,100'", null);
+    try testing.expect(result.isTrue());
+
+    // Zendriver's scroll_up: a positive yDistance moves the content back up.
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Input.synthesizeScrollGesture",
+        .params = .{ .x = 0, .y = 0, .yDistance = 250 },
+    });
+    try ctx.expectSentResult(null, .{ .id = 3 });
+    result = try ls.local.compileAndRun("window.scrollY === 350", null);
     try testing.expect(result.isTrue());
 }
 
