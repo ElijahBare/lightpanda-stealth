@@ -31,28 +31,33 @@ const Brand = struct {
     version: []const u8,
 };
 
-fn getBrands(_: *const NavigatorUAData) []const Brand {
-    return brandList();
+fn getBrands(_: *const NavigatorUAData, exec: *const Execution) []const Brand {
+    return brandList(isStealth(exec));
 }
 
 fn getMobile(_: *const NavigatorUAData) bool {
     return false;
 }
 
-fn getPlatform(_: *const NavigatorUAData) []const u8 {
-    return uaPlatform();
+fn getPlatform(_: *const NavigatorUAData, exec: *const Execution) []const u8 {
+    return uaPlatform(isStealth(exec));
 }
 
-pub fn toJSON(_: *const NavigatorUAData) struct {
+pub fn toJSON(_: *const NavigatorUAData, exec: *const Execution) struct {
     brands: []const Brand,
     mobile: bool,
     platform: []const u8,
 } {
+    const stealth = isStealth(exec);
     return .{
         .mobile = false,
-        .brands = brandList(),
-        .platform = uaPlatform(),
+        .brands = brandList(stealth),
+        .platform = uaPlatform(stealth),
     };
+}
+
+fn isStealth(exec: *const Execution) bool {
+    return exec.session.browser.http_client.isStealth();
 }
 
 fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
@@ -62,37 +67,54 @@ fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, ex
 
     _ = hints;
 
-    const brands = brandList();
+    const stealth = isStealth(exec);
+    const full_versions = fullVersionList(stealth);
 
     return exec.js.local.?.resolvePromise(.{
-        .brands = brandList(),
+        .brands = brandList(stealth),
         .mobile = false,
-        .platform = uaPlatform(),
+        .platform = uaPlatform(stealth),
         .architecture = uaArchitecture(),
         .bitness = uaBitness(),
         .model = "",
         .platformVersion = "",
-        .uaFullVersion = if (brands.len > 0) brands[0].version else "1.0.0.0",
-        .fullVersionList = brands,
+        .uaFullVersion = if (full_versions.len > 0) full_versions[0].version else "1.0.0.0",
+        .fullVersionList = full_versions,
         .wow64 = false,
         .formFactor = [_][]const u8{"Desktop"},
     });
 }
 
-fn brandList() []const Brand {
-    const out = comptime blk: {
-        const src = &Config.HttpHeaders.brands;
-        var arr: [src.len]Brand = undefined;
-        for (src, 0..) |b, i| {
-            arr[i] = .{ .brand = b.brand, .version = b.full_version };
-        }
-        const final = arr;
-        break :blk final;
-    };
-    return &out;
+// Chrome's `brands` carry the major version; Lightpanda's own historically
+// carry the full one.
+fn brandList(stealth: bool) []const Brand {
+    if (stealth) {
+        return comptime toBrands(Config.HttpHeaders.Chrome.hints, .major);
+    }
+    return comptime toBrands(Config.HttpHeaders.lightpanda_hints, .full);
 }
 
-fn uaPlatform() []const u8 {
+fn fullVersionList(stealth: bool) []const Brand {
+    if (stealth) {
+        return comptime toBrands(Config.HttpHeaders.Chrome.hints, .full);
+    }
+    return comptime toBrands(Config.HttpHeaders.lightpanda_hints, .full);
+}
+
+fn toBrands(comptime hints: Config.HttpHeaders.ClientHints, comptime version: enum { major, full }) []const Brand {
+    const src = hints.brands;
+    var arr: [src.len]Brand = undefined;
+    for (src, 0..) |b, i| {
+        arr[i] = .{ .brand = b.brand, .version = if (version == .major) b.version else b.full_version };
+    }
+    const final = arr;
+    return &final;
+}
+
+fn uaPlatform(stealth: bool) []const u8 {
+    if (stealth) {
+        return Config.HttpHeaders.Chrome.ua_platform;
+    }
     return switch (builtin.target.os.tag) {
         .macos => "macOS",
         .windows => "Windows",

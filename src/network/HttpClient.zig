@@ -160,6 +160,10 @@ test_fail_submit: if (lp.IS_TEST) ?anyerror else void = if (lp.IS_TEST) null els
 // Allocated from self.allocator when set, null otherwise.
 user_agent_override: ?[:0]const u8 = null,
 
+// navigator.platform override set alongside the user agent override (CDP
+// setUserAgentOverride's `platform`). Cleared with it.
+platform_override: ?[:0]const u8 = null,
+
 // Accept-Language override set via CDP Emulation.setUserAgentOverride.
 // Drives both the request header and navigator.languages.
 accept_language_override: ?lp.Config.HttpHeaders.AcceptLanguage = null,
@@ -305,18 +309,42 @@ pub fn incrReqId(self: *Client) u32 {
     return id;
 }
 
-// Set a user agent override, allocated from self.allocator.
-pub fn setUserAgentOverride(self: *Client, ua: []const u8) !void {
+// Set a user agent override, allocated from self.allocator. Like Chrome, it
+// replaces any previous override whole, so a null `platform` restores the
+// default navigator.platform.
+pub fn setUserAgentOverride(self: *Client, ua: []const u8, platform: ?[]const u8) !void {
     self.clearUserAgentOverride();
     self.user_agent_override = try self.allocator.dupeSentinel(u8, ua, 0);
+    if (platform) |p| {
+        if (p.len > 0) {
+            self.platform_override = try self.allocator.dupeSentinel(u8, p, 0);
+        }
+    }
 }
 
-// Clear any user agent override, restoring the default from config.
+// Clear any user agent (and platform) override, restoring the defaults.
 pub fn clearUserAgentOverride(self: *Client) void {
     if (self.user_agent_override) |ua| {
         self.allocator.free(ua);
         self.user_agent_override = null;
     }
+    if (self.platform_override) |p| {
+        self.allocator.free(p);
+        self.platform_override = null;
+    }
+}
+
+// --stealth: present as a regular desktop Chrome.
+pub fn isStealth(self: *const Client) bool {
+    return self.network.config.http_headers.stealth;
+}
+
+pub fn getClientHints(self: *const Client) *const lp.Config.HttpHeaders.ClientHints {
+    return self.network.config.http_headers.client_hints;
+}
+
+pub fn getPlatformOverride(self: *const Client) ?[:0]const u8 {
+    return self.platform_override;
 }
 
 // Set an Accept-Language override, allocated from self.allocator.
@@ -472,16 +500,38 @@ pub fn getLanguages(self: *const Client) []const []const u8 {
     return (self.accept_language_override orelse self.network.config.http_headers.accept_language).languages;
 }
 
+pub const BaselineHeaders = struct {
+    buf: [5]Transfer.RequestHeader,
+    len: usize,
+
+    pub fn slice(self: *const BaselineHeaders) []const Transfer.RequestHeader {
+        return self.buf[0..self.len];
+    }
+};
+
 // Headers _all_ requests include.
-pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
-    return .{
+pub fn baselineHeaders(self: *const Client) BaselineHeaders {
+    const hints = self.getClientHints();
+    // Omitting Accept-Language triggers bot-protection on some CDNs
+    // (Akamai) when Accept-Encoding is present.
+    const accept_language: Transfer.RequestHeader = .{ .name = "Accept-Language", .value = self.getAcceptLanguage() };
+    if (self.isStealth()) {
+        // Chrome's default (low-entropy) client hints.
+        return .{ .len = 5, .buf = .{
+            .{ .name = "User-Agent", .value = self.getUserAgent() },
+            .{ .name = "Sec-Ch-Ua", .value = hints.sec_ch_ua, .source = .fixed },
+            .{ .name = "Sec-Ch-Ua-Mobile", .value = "?0", .source = .fixed },
+            .{ .name = "Sec-Ch-Ua-Platform", .value = lp.Config.HttpHeaders.Chrome.sec_ch_ua_platform, .source = .fixed },
+            accept_language,
+        } };
+    }
+    return .{ .len = 4, .buf = .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
-        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
-        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
-        // Omitting Accept-Language triggers bot-protection on some CDNs
-        // (Akamai) when Accept-Encoding is present.
-        .{ .name = "Accept-Language", .value = self.getAcceptLanguage() },
-    };
+        .{ .name = "Sec-Ch-Ua", .value = hints.sec_ch_ua, .source = .fixed },
+        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = hints.sec_ch_ua_full_version_list, .source = .fixed },
+        accept_language,
+        undefined,
+    } };
 }
 
 pub fn abort(self: *Client) void {
@@ -4157,7 +4207,7 @@ pub const Transfer = struct {
     }
 
     fn putHeader(self: *Transfer, name: []const u8, value: []const u8, source: HeaderSource, mode: enum { set, append }) !void {
-        if (verifyHeader(name, value) == false) {
+        if (self.verifyHeader(name, value) == false) {
             return;
         }
 
@@ -4197,9 +4247,9 @@ pub const Transfer = struct {
 
     // Central gate for every header entering req_headers; name-keyed
     // restrictions live here so entry points don't need their own checks.
-    fn verifyHeader(name: []const u8, value: []const u8) bool {
+    fn verifyHeader(self: *const Transfer, name: []const u8, value: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "user-agent")) {
-            lp.Config.validateUserAgent(value) catch |err| {
+            lp.Config.validateUserAgent(value, .{ .stealth = self.client.isStealth() }) catch |err| {
                 log.debug(.http, "invalid header dropped", .{ .name = name, .err = err });
                 return false;
             };
@@ -4209,7 +4259,8 @@ pub const Transfer = struct {
 
     // The client's baseline headers, added to every request at creation.
     fn seedHeaders(self: *Transfer) !void {
-        for (self.client.baselineHeaders()) |hdr| {
+        const baseline = self.client.baselineHeaders();
+        for (baseline.slice()) |hdr| {
             try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
         }
 
@@ -5325,7 +5376,7 @@ fn testTransfer(arena: *lp.Arena) Transfer {
             .resource_type = .document,
             .shutdown_callback = noopShutdown,
         },
-        .client = undefined,
+        .client = &testing.test_browser.http_client,
         .id = 1,
         .start_time = 0,
     };
@@ -6647,4 +6698,59 @@ test "HttpClient: encodedDataLength of a cache hit is the stored body, of a reva
 
     _ = try e.fetch("http://127.0.0.1:9582/raw/revalidated", null);
     try testing.expectEqual(raw.not_modified.head.len, try e.fetch("http://127.0.0.1:9582/raw/revalidated", null));
+}
+
+test "HttpClient: baselineHeaders follow --stealth" {
+    const client = &testing.test_browser.http_client;
+    {
+        const baseline = client.baselineHeaders();
+        const headers = baseline.slice();
+        try testing.expectEqual(4, headers.len);
+        try testing.expectEqual("User-Agent", headers[0].name);
+        try testing.expect(std.mem.startsWith(u8, headers[0].value, "Lightpanda/1.0"));
+        try testing.expectEqual("Sec-Ch-Ua", headers[1].name);
+        try testing.expect(std.mem.find(u8, headers[1].value, "Lightpanda") != null);
+        try testing.expectEqual("Sec-Ch-Ua-Full-Version-List", headers[2].name);
+        try testing.expectEqual("Accept-Language", headers[3].name);
+    }
+
+    const saved = testing.enableStealth();
+    defer testing.restoreHttpHeaders(saved);
+    {
+        const baseline = client.baselineHeaders();
+        const headers = baseline.slice();
+        try testing.expectEqual(5, headers.len);
+        try testing.expectEqual("User-Agent", headers[0].name);
+        try testing.expectEqual(testing.stealth_test_user_agent, headers[0].value);
+        try testing.expectEqual("Sec-Ch-Ua", headers[1].name);
+        try testing.expectEqual(lp.Config.HttpHeaders.Chrome.hints.sec_ch_ua, headers[1].value);
+        try testing.expectEqual("Sec-Ch-Ua-Mobile", headers[2].name);
+        try testing.expectEqual("?0", headers[2].value);
+        try testing.expectEqual("Sec-Ch-Ua-Platform", headers[3].name);
+        try testing.expectEqual("\"" ++ lp.Config.HttpHeaders.Chrome.ua_platform ++ "\"", headers[3].value);
+        try testing.expectEqual("Accept-Language", headers[4].name);
+        try testing.expectEqual("en-US,en;q=0.9", headers[4].value);
+    }
+
+    // The User-Agent header follows a CDP override.
+    try client.setUserAgentOverride("Mozilla/5.0 Override", null);
+    defer client.clearUserAgentOverride();
+    try testing.expectEqual("Mozilla/5.0 Override", client.baselineHeaders().slice()[0].value);
+}
+
+test "HttpClient: a browser User-Agent header is only accepted with --stealth" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const arena = try pool.acquire(.small, "test");
+    defer arena.release();
+
+    var transfer = testTransfer(arena);
+    try transfer.setHeader("User-Agent", "Mozilla/5.0", .{ .source = .author });
+    try testing.expectEqual(null, transfer.findRequestHeader("user-agent"));
+
+    const saved = testing.enableStealth();
+    defer testing.restoreHttpHeaders(saved);
+    try transfer.setHeader("User-Agent", "Mozilla/5.0", .{ .source = .author });
+    try testing.expectEqual("Mozilla/5.0", transfer.findRequestHeader("user-agent").?);
 }

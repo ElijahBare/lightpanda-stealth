@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<script src="testing.js"></script>
+
+<!-- Run with --stealth: presents as a regular (headful, non-automated) desktop Chrome. -->
+<script id=stealth_navigator>
+  const ua = navigator.userAgent;
+  testing.expectEqual(true, ua.startsWith('Mozilla/5.0 ('));
+  // The test runner suffixes the user agent with " internal-tester".
+  testing.expectEqual(true, / AppleWebKit\/537\.36 \(KHTML, like Gecko\) Chrome\/\d+\.0\.0\.0 Safari\/537\.36 internal-tester$/.test(ua));
+  testing.expectEqual(false, ua.includes('Headless'));
+  testing.expectEqual(false, ua.includes('Lightpanda'));
+
+  // Chrome: appVersion is the user agent without "Mozilla/".
+  testing.expectEqual(ua.substring('Mozilla/'.length), navigator.appVersion);
+  testing.expectEqual('Google Inc.', navigator.vendor);
+  testing.expectEqual('Netscape', navigator.appName);
+  testing.expectEqual('Mozilla', navigator.appCodeName);
+  testing.expectEqual('Gecko', navigator.product);
+  testing.expectEqual(false, navigator.webdriver);
+
+  // navigator.platform agrees with the user agent's OS token.
+  const platforms = {
+    'X11; Linux x86_64': 'Linux x86_64',
+    'Macintosh; Intel Mac OS X 10_15_7': 'MacIntel',
+    'Windows NT 10.0; Win64; x64': 'Win32',
+  };
+  const os = ua.substring('Mozilla/5.0 ('.length, ua.indexOf(')'));
+  testing.expectEqual(platforms[os], navigator.platform);
+
+  testing.expectEqual('en-US', navigator.language);
+  testing.expectEqual('en-US,en', navigator.languages.join());
+  testing.expectEqual('en-US', Intl.DateTimeFormat().resolvedOptions().locale);
+</script>
+
+<script id=stealth_userAgentData>
+  const major = navigator.userAgent.match(/Chrome\/(\d+)\./)[1];
+  const brands = navigator.userAgentData.brands;
+  testing.expectEqual(3, brands.length);
+  testing.expectEqual('Google Chrome', brands[0].brand);
+  testing.expectEqual(major, brands[0].version);
+  testing.expectEqual('Chromium', brands[2].brand);
+  testing.expectEqual(major, brands[2].version);
+  testing.expectEqual(false, navigator.userAgentData.mobile);
+
+  const uaPlatforms = { 'Linux x86_64': 'Linux', 'MacIntel': 'macOS', 'Win32': 'Windows' };
+  testing.expectEqual(uaPlatforms[navigator.platform], navigator.userAgentData.platform);
+  testing.expectEqual(navigator.userAgentData.platform, navigator.userAgentData.toJSON().platform);
+</script>
+
+<script id=stealth_userAgentData_highEntropy type=module>
+  {
+    const state = await testing.async();
+    const v = await navigator.userAgentData.getHighEntropyValues(['fullVersionList']);
+    state.resolve();
+
+    await state.done(() => {
+      const major = navigator.userAgent.match(/Chrome\/(\d+)\./)[1];
+      testing.expectEqual('Google Chrome', v.fullVersionList[0].brand);
+      testing.expectEqual(true, v.fullVersionList[0].version.startsWith(major + '.'));
+      testing.expectEqual(v.fullVersionList[0].version, v.uaFullVersion);
+      testing.expectEqual(major, v.brands[0].version);
+    });
+  }
+</script>
+
+<script id=stealth_worker type=module>
+  {
+    const state = await testing.async();
+    const src = `postMessage([navigator.userAgent, navigator.appVersion, navigator.vendor, navigator.platform].join('|'))`;
+    const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    const got = await new Promise((resolve) => { worker.onmessage = (e) => resolve(e.data); });
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual([navigator.userAgent, navigator.appVersion, navigator.vendor, navigator.platform].join('|'), got);
+    });
+  }
+</script>

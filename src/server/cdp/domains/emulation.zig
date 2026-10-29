@@ -146,18 +146,22 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
         platform: ?[]const u8 = null,
     })) orelse return error.InvalidParams;
 
-    if (params.platform) |v| {
-        log.debug(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "platform", .value = v });
-    }
-
     const ua = params.userAgent;
-    const reserved = if (Config.validateUserAgent(ua)) false else |err| switch (err) {
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const http_client = &cmd.cdp.browser.http_client;
+
+    // In stealth mode a browser user agent is what automation libraries
+    // (e.g. zendriver stripping "Headless") send, so it's accepted.
+    const reserved = if (Config.validateUserAgent(ua, .{ .stealth = http_client.isStealth() })) false else |err| switch (err) {
         error.NonPrintable => return cmd.sendError(-32602, "User agent contains non-printable characters", .{}),
         error.Reserved => true,
     };
 
-    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const http_client = &cmd.cdp.browser.http_client;
+    if (params.platform) |platform| {
+        if (!Mime.isHttpHeaderValue(platform)) {
+            return cmd.sendError(-32602, "Platform contains CR, LF or NUL", .{});
+        }
+    }
 
     // Applied even when the user agent is refused below: Playwright always
     // sends a Mozilla user agent alongside the locale it was asked for.
@@ -173,7 +177,9 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
         return cmd.sendResult(null, .{});
     }
 
-    try http_client.setUserAgentOverride(ua);
+    // Drives the User-Agent header and navigator.userAgent / appVersion /
+    // platform alike.
+    try http_client.setUserAgentOverride(ua, params.platform);
     bc.user_agent_changed = true;
 
     return cmd.sendResult(null, .{});

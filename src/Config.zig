@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zenai = @import("zenai");
 const lp = @import("lightpanda");
 
@@ -284,7 +285,9 @@ const CommonOptions = .{
     .{ .name = "web_bot_auth_keyid", .type = ?[]const u8 },
     .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
     .{ .name = "user_agent", .type = ?[]const u8, .validator = userAgentValidator },
+    .{ .name = "stealth", .type = bool },
     .{ .name = "locale", .type = [:0]const u8, .default = HttpHeaders.default_locale, .validator = localeValidator },
+    .{ .name = "lang", .type = .{ .cli = [:0]const u8, .memory = ?Lang }, .validator = langValidator },
     .{ .name = "timezone", .type = ?[:0]const u8, .validator = timezoneValidator },
     .{ .name = "block_private_networks", .type = bool },
     .{ .name = "block_cidrs", .type = ?[]const u8, .validator = accumulateValidator },
@@ -787,12 +790,41 @@ pub fn userAgent(self: *const Config) ?[]const u8 {
     };
 }
 
+pub fn stealth(self: *const Config) bool {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.stealth,
+        else => false,
+    };
+}
+
+/// The primary language tag: --lang's first tag when given, else --locale.
+/// Drives navigator.language and the default locale of Intl.
 pub fn locale(self: *const Config) [:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.locale,
+        inline .serve, .fetch, .mcp, .agent => |opts| if (opts.lang) |l| l.tag else opts.locale,
         else => HttpHeaders.default_locale,
     };
 }
+
+fn lang(self: *const Config) ?Lang {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.lang,
+        else => null,
+    };
+}
+
+/// --lang, zendriver/Chrome style: either a single tag ("de-DE"), expanded
+/// the way --locale is, or a full Accept-Language list ("en-US,en;q=0.9")
+/// sent verbatim. navigator.language(s), Accept-Language and Intl all
+/// follow it.
+pub const Lang = struct {
+    // The value as given.
+    value: [:0]const u8,
+    // Its first language tag.
+    tag: [:0]const u8,
+    // Whether `value` is a list (or carries a q value), not a single tag.
+    is_list: bool,
+};
 
 pub fn timezone(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
@@ -1065,29 +1097,74 @@ pub const HttpHeaders = struct {
         full_version: []const u8,
     };
 
-    /// Source of truth for client-hints brand data. Both the Sec-Ch-Ua
-    /// HTTP header and navigator.userAgentData.brands derive from this
-    /// list, so the two sides cannot drift.
-    pub const brands = [_]Brand{
+    /// Client-hints brand data. Both the Sec-Ch-Ua HTTP headers and
+    /// navigator.userAgentData derive from one of these, so the two sides
+    /// cannot drift.
+    pub const ClientHints = struct {
+        brands: []const Brand,
+        sec_ch_ua: [:0]const u8,
+        sec_ch_ua_full_version_list: [:0]const u8,
+
+        fn init(comptime brands: []const Brand) ClientHints {
+            var sec_ch_ua: [:0]const u8 = "";
+            var full_version_list: [:0]const u8 = "";
+            for (brands, 0..) |b, i| {
+                const sep = if (i == 0) "" else ", ";
+                sec_ch_ua = sec_ch_ua ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
+                full_version_list = full_version_list ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.full_version ++ "\"";
+            }
+            return .{
+                .brands = brands,
+                .sec_ch_ua = sec_ch_ua,
+                .sec_ch_ua_full_version_list = full_version_list,
+            };
+        }
+    };
+
+    pub const lightpanda_hints: ClientHints = .init(&.{
         .{ .brand = "Lightpanda", .version = "1", .full_version = lp.build_config.version },
-    };
+    });
 
-    pub const sec_ch_ua: [:0]const u8 = blk: {
-        var out: [:0]const u8 = "";
-        for (brands, 0..) |b, i| {
-            const sep = if (i == 0) "" else ", ";
-            out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.version ++ "\"";
-        }
-        break :blk out;
-    };
+    /// What --stealth presents as: a regular desktop Chrome, headful and not
+    /// automated, on the platform Lightpanda was built for. Bump `major` and
+    /// `full_version` together.
+    pub const Chrome = struct {
+        pub const major = "141";
+        pub const full_version = "141.0.7390.54";
 
-    pub const sec_ch_ua_full_version_list: [:0]const u8 = blk: {
-        var out: [:0]const u8 = "";
-        for (brands, 0..) |b, i| {
-            const sep = if (i == 0) "" else ", ";
-            out = out ++ sep ++ "\"" ++ b.brand ++ "\";v=\"" ++ b.full_version ++ "\"";
-        }
-        break :blk out;
+        const os_token = switch (builtin.target.os.tag) {
+            .macos => "Macintosh; Intel Mac OS X 10_15_7",
+            .windows => "Windows NT 10.0; Win64; x64",
+            else => "X11; Linux x86_64",
+        };
+
+        /// Chrome's reduced User-Agent: a frozen OS token and the version
+        /// reduced to MAJOR.0.0.0. Never contains "Headless".
+        pub const user_agent: [:0]const u8 = "Mozilla/5.0 (" ++ os_token ++ ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" ++ major ++ ".0.0.0 Safari/537.36";
+
+        /// navigator.platform, matching `os_token`.
+        pub const platform: [:0]const u8 = switch (builtin.target.os.tag) {
+            .macos => "MacIntel",
+            .windows => "Win32",
+            else => "Linux x86_64",
+        };
+
+        /// navigator.userAgentData.platform and the Sec-Ch-Ua-Platform header.
+        pub const ua_platform: [:0]const u8 = switch (builtin.target.os.tag) {
+            .macos => "macOS",
+            .windows => "Windows",
+            else => "Linux",
+        };
+
+        pub const sec_ch_ua_platform: [:0]const u8 = "\"" ++ ua_platform ++ "\"";
+
+        pub const vendor = "Google Inc.";
+
+        pub const hints: ClientHints = .init(&.{
+            .{ .brand = "Google Chrome", .version = major, .full_version = full_version },
+            .{ .brand = "Not?A_Brand", .version = "8", .full_version = "8.0.0.0" },
+            .{ .brand = "Chromium", .version = major, .full_version = full_version },
+        });
     };
 
     // The neutral default: some bot-protection frontends (e.g. Akamai on
@@ -1099,6 +1176,10 @@ pub const HttpHeaders = struct {
     pub const navigation_accept: [:0]const u8 = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 
     user_agent: [:0]const u8, // User agent value (e.g. "Lightpanda/1.0")
+
+    // --stealth: present as a regular desktop Chrome (see `Chrome`).
+    stealth: bool,
+    client_hints: *const ClientHints,
 
     proxy_bearer_header: ?[:0]const u8,
 
@@ -1140,12 +1221,14 @@ pub const HttpHeaders = struct {
     };
 
     pub fn init(allocator: Allocator, config: *const Config) !HttpHeaders {
+        const is_stealth = config.stealth();
+        const default_user_agent = if (is_stealth) Chrome.user_agent else user_agent_base;
         const user_agent: [:0]const u8 = if (config.userAgent()) |ua|
             try allocator.dupeSentinel(u8, ua, 0)
         else if (config.userAgentSuffix()) |suffix|
-            try allocator.printSentinel("{s} {s}", .{ user_agent_base, suffix }, 0)
+            try allocator.printSentinel("{s} {s}", .{ default_user_agent, suffix }, 0)
         else
-            user_agent_base;
+            default_user_agent;
         errdefer if (config.userAgent() != null or config.userAgentSuffix() != null) allocator.free(user_agent);
 
         const proxy_bearer_header: ?[:0]const u8 = if (config.proxyBearerToken()) |token|
@@ -1155,10 +1238,16 @@ pub const HttpHeaders = struct {
         errdefer if (proxy_bearer_header) |hdr| allocator.free(hdr);
 
         var buf: [64]u8 = undefined;
-        const accept_language: AcceptLanguage = try .init(allocator, acceptLanguageFor(&buf, config.locale()));
+        const accept_language_value = if (config.lang()) |l|
+            (if (l.is_list) l.value else acceptLanguageFor(&buf, l.tag))
+        else
+            acceptLanguageFor(&buf, config.locale());
+        const accept_language: AcceptLanguage = try .init(allocator, accept_language_value);
 
         return .{
             .user_agent = user_agent,
+            .stealth = is_stealth,
+            .client_hints = if (is_stealth) &Chrome.hints else &lightpanda_hints,
             .proxy_bearer_header = proxy_bearer_header,
             .accept_language = accept_language,
         };
@@ -1168,7 +1257,7 @@ pub const HttpHeaders = struct {
         if (self.proxy_bearer_header) |hdr| {
             allocator.free(hdr);
         }
-        if (self.user_agent.ptr != user_agent_base.ptr) {
+        if (self.user_agent.ptr != user_agent_base.ptr and self.user_agent.ptr != Chrome.user_agent.ptr) {
             allocator.free(self.user_agent);
         }
         self.accept_language.deinit(allocator);
@@ -1327,6 +1416,16 @@ pub fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
         }
     }
 
+    switch (command) {
+        inline .serve, .fetch, .mcp, .agent => |opts| if (opts.user_agent) |ua| {
+            validateUserAgent(ua, .{ .stealth = opts.stealth }) catch |err| {
+                log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "can't contain Mozilla unless --stealth is set" });
+                return error.InvalidArgument;
+            };
+        },
+        else => {},
+    }
+
     if (command == .fetch and command.fetch.url.items.len == 0) {
         log.fatal(.app, "missing URL", .{ .hint = "usage: lightpanda fetch <url>... [OPTIONS]" });
         return error.MissingArgument;
@@ -1415,9 +1514,121 @@ test "Config: advertiseHost preserves concrete host when not a wildcard" {
 
 test "Config: parseArgs refuses a mozilla user-agent" {
     log.expectLog(&.{.app});
-    const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "mozilla/1.0" };
+    // The check runs once every option is parsed (--stealth lifts it), so
+    // parseArgs has allocated by then; an arena stands in for main's.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "mozilla/1.0", "https://example.com" };
     const proc_args: std.process.Args = .{ .vector = &argv };
-    try std.testing.expectError(error.InvalidArgument, parseArgs(std.testing.allocator, proc_args));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(arena.allocator(), proc_args));
+}
+
+test "Config: parseArgs --stealth" {
+    // parseArgs allocations live for the process; an arena stands in for main's.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    {
+        // Default: Lightpanda's own user agent and client hints.
+        const argv = [_][*:0]const u8{ "lightpanda", "serve" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqual(false, config.stealth());
+        try std.testing.expectEqual(false, config.http_headers.stealth);
+        try std.testing.expectEqualStrings("Lightpanda/1.0", config.http_headers.user_agent);
+        try std.testing.expect(std.mem.find(u8, config.http_headers.client_hints.sec_ch_ua, "Lightpanda") != null);
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--stealth" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqual(true, config.stealth());
+        try std.testing.expectEqual(true, config.http_headers.stealth);
+        const ua = config.http_headers.user_agent;
+        try std.testing.expectEqualStrings(HttpHeaders.Chrome.user_agent, ua);
+        try std.testing.expect(std.mem.startsWith(u8, ua, "Mozilla/5.0 ("));
+        try std.testing.expect(std.mem.find(u8, ua, "Chrome/" ++ HttpHeaders.Chrome.major ++ ".0.0.0") != null);
+        try std.testing.expect(std.mem.find(u8, ua, "Headless") == null);
+        try std.testing.expect(std.mem.find(u8, ua, "Lightpanda") == null);
+        try std.testing.expectEqualStrings(
+            "\"Google Chrome\";v=\"" ++ HttpHeaders.Chrome.major ++ "\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"" ++ HttpHeaders.Chrome.major ++ "\"",
+            config.http_headers.client_hints.sec_ch_ua,
+        );
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--stealth", "https://example.com" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings(HttpHeaders.Chrome.user_agent, config.http_headers.user_agent);
+    }
+    {
+        // An explicit --user-agent still wins, and may then look like a
+        // browser, whatever the flag order.
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--user-agent", "Mozilla/5.0 Custom", "--stealth" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings("Mozilla/5.0 Custom", config.http_headers.user_agent);
+        try std.testing.expectEqual(true, config.http_headers.stealth);
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--stealth", "--user-agent-suffix", "x/1" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings(HttpHeaders.Chrome.user_agent ++ " x/1", config.http_headers.user_agent);
+    }
+}
+
+test "Config: parseArgs --lang" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    {
+        // --stealth keeps Chrome's en-US default.
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--stealth" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings("en-US", config.locale());
+        try std.testing.expectEqualStrings("en-US,en;q=0.9", config.http_headers.accept_language.header);
+        try std.testing.expectEqual(2, config.http_headers.accept_language.languages.len);
+        try std.testing.expectEqualStrings("en-US", config.http_headers.accept_language.languages[0]);
+        try std.testing.expectEqualStrings("en", config.http_headers.accept_language.languages[1]);
+    }
+    {
+        // A full Accept-Language list is sent verbatim.
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--lang", "fr-FR,fr;q=0.9,en;q=0.5" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings("fr-FR", config.locale());
+        try std.testing.expectEqualStrings("fr-FR,fr;q=0.9,en;q=0.5", config.http_headers.accept_language.header);
+        try std.testing.expectEqual(3, config.http_headers.accept_language.languages.len);
+        try std.testing.expectEqualStrings("en", config.http_headers.accept_language.languages[2]);
+    }
+    {
+        // A single tag expands like --locale, and wins over it.
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--locale", "it", "--lang", "de-DE", "--stealth" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings("de-DE", config.locale());
+        try std.testing.expectEqualStrings("de-DE,de;q=0.9,en;q=0.8", config.http_headers.accept_language.header);
+    }
+}
+
+test "Config: parseLang" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const single = try parseLang(allocator, "en-US");
+    try std.testing.expectEqualStrings("en-US", single.tag);
+    try std.testing.expectEqual(false, single.is_list);
+
+    const list = try parseLang(allocator, " en-GB , en;q=0.8");
+    try std.testing.expectEqualStrings("en-GB", list.tag);
+    try std.testing.expectEqual(true, list.is_list);
+
+    try std.testing.expectError(error.InvalidLanguage, parseLang(allocator, ""));
+    try std.testing.expectError(error.InvalidLanguage, parseLang(allocator, "en-US,"));
+    try std.testing.expectError(error.InvalidLanguage, parseLang(allocator, "en_US"));
+    try std.testing.expectError(error.InvalidHeaderValue, parseLang(allocator, "en\r\nX: 1"));
+}
+
+test "Config: HttpHeaders stealth user agent is freed only when owned" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{ .stealth = true } });
+    config.deinit(std.testing.allocator);
+    config = try Config.init(std.testing.allocator, "test", .{ .serve = .{ .stealth = true, .user_agent_suffix = "s" } });
+    config.deinit(std.testing.allocator);
 }
 
 test "Config: parseArgs --http-version" {
@@ -1542,10 +1753,13 @@ test "Config: parseArgs tells a url from a misspelt command" {
 }
 
 test "Config: validateUserAgent" {
-    try validateUserAgent("Lightpanda/1.0");
-    try std.testing.expectError(error.Reserved, validateUserAgent("mozilla/1.0"));
-    try std.testing.expectError(error.Reserved, validateUserAgent("Mozilla/5.0"));
-    try std.testing.expectError(error.NonPrintable, validateUserAgent("bad\x01ua"));
+    try validateUserAgent("Lightpanda/1.0", .{});
+    try std.testing.expectError(error.Reserved, validateUserAgent("mozilla/1.0", .{}));
+    try std.testing.expectError(error.Reserved, validateUserAgent("Mozilla/5.0", .{}));
+    try std.testing.expectError(error.NonPrintable, validateUserAgent("bad\x01ua", .{}));
+
+    try validateUserAgent("Mozilla/5.0", .{ .stealth = true });
+    try std.testing.expectError(error.NonPrintable, validateUserAgent("bad\x01ua", .{ .stealth = true }));
 }
 
 test "Config: validateLocale" {
@@ -1749,9 +1963,11 @@ fn accumulateValidator(allocator: Allocator, args: *std.process.Args.Iterator, f
     field.* = try std.mem.join(allocator, ",", &.{ existing, str });
 }
 
+// Only the printable check here: whether "Mozilla" is allowed depends on
+// --stealth, which may come later on the command line (see parseArgs).
 fn userAgentValidator(allocator: Allocator, args: *std.process.Args.Iterator, ua: *?[]const u8) !void {
     const str = args.next() orelse return error.MissingArgument;
-    validateUserAgent(str) catch |err| {
+    validateUserAgent(str, .{ .stealth = true }) catch |err| {
         log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII and can't contain Mozilla" });
         return error.InvalidArgument;
     };
@@ -1759,14 +1975,19 @@ fn userAgentValidator(allocator: Allocator, args: *std.process.Args.Iterator, ua
     ua.* = try allocator.dupe(u8, str);
 }
 
-pub fn validateUserAgent(ua: []const u8) !void {
+pub const ValidateUserAgentOpts = struct {
+    // In stealth mode a browser-looking ("Mozilla/...") user agent is allowed.
+    stealth: bool = false,
+};
+
+pub fn validateUserAgent(ua: []const u8, opts: ValidateUserAgentOpts) !void {
     for (ua) |c| {
         if (!std.ascii.isPrint(c)) {
             return error.NonPrintable;
         }
     }
 
-    if (std.ascii.findIgnoreCase(ua, "mozilla") != null) {
+    if (!opts.stealth and std.ascii.findIgnoreCase(ua, "mozilla") != null) {
         return error.Reserved;
     }
 }
@@ -1778,6 +1999,37 @@ fn localeValidator(allocator: Allocator, args: *std.process.Args.Iterator, field
         return error.InvalidArgument;
     };
     field.* = try allocator.dupeSentinel(u8, str, 0);
+}
+
+fn langValidator(allocator: Allocator, args: *std.process.Args.Iterator, field: *?Lang) !void {
+    const str = args.next() orelse return error.MissingArgument;
+    field.* = parseLang(allocator, str) catch |err| {
+        log.fatal(.app, "invalid option value", .{ .arg = "--lang", .value = str, .err = err, .hint = "must be a BCP 47 tag such as en-US or an Accept-Language list such as \"en-US,en;q=0.9\"" });
+        return error.InvalidArgument;
+    };
+}
+
+pub fn parseLang(allocator: Allocator, str: []const u8) !Lang {
+    if (!Mime.isHttpHeaderValue(str)) {
+        return error.InvalidHeaderValue;
+    }
+    var first: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, str, ',');
+    while (it.next()) |item| {
+        const end = std.mem.findScalar(u8, item, ';') orelse item.len;
+        const tag = std.mem.trim(u8, item[0..end], " \t");
+        try validateLocale(tag);
+        if (first == null) {
+            first = tag;
+        }
+    }
+    const value = try allocator.dupeSentinel(u8, std.mem.trim(u8, str, " \t"), 0);
+    errdefer allocator.free(value);
+    return .{
+        .value = value,
+        .tag = try allocator.dupeSentinel(u8, first.?, 0),
+        .is_list = std.mem.findAny(u8, str, ",;") != null,
+    };
 }
 
 fn timezoneValidator(allocator: Allocator, args: *std.process.Args.Iterator, field: *?[:0]const u8) !void {

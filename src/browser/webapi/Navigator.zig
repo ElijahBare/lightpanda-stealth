@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const js = @import("../js/js.zig");
+const Config = @import("../../Config.zig");
 const URL = @import("../URL.zig");
 const Frame = @import("../Frame.zig");
 const BodyInit = @import("net/body_init.zig").BodyInit;
@@ -78,7 +79,14 @@ pub fn getAppCodeName(_: *const Navigator) []const u8 {
     return "Mozilla";
 }
 
-pub fn getAppVersion(_: *const Navigator) []const u8 {
+pub fn getAppVersion(self: *const Navigator, exec: *const Execution) []const u8 {
+    // Chrome derives appVersion from the user agent: everything after
+    // "Mozilla/". Only a browser-like (--stealth or overridden) one has it.
+    const ua = self.getUserAgent(exec);
+    const prefix = "Mozilla/";
+    if (std.mem.startsWith(u8, ua, prefix)) {
+        return ua[prefix.len..];
+    }
     return switch (builtin.target.os.tag) {
         .macos => "5.0 (Macintosh)",
         .windows => "5.0 (Windows)",
@@ -111,14 +119,16 @@ fn getMaxTouchPoints(_: *const Navigator) u32 {
     return 0;
 }
 
-pub fn getVendor(_: *const Navigator) []const u8 {
-    return "";
+pub fn getVendor(_: *const Navigator, exec: *const Execution) []const u8 {
+    return if (exec.session.browser.http_client.isStealth()) Config.HttpHeaders.Chrome.vendor else "";
 }
 
 pub fn getProduct(_: *const Navigator) []const u8 {
     return "Gecko";
 }
 
+// Chrome launched without automation flags (e.g. with
+// --disable-blink-features=AutomationControlled) reports false.
 fn getWebdriver(_: *const Navigator) bool {
     return false;
 }
@@ -132,7 +142,14 @@ pub fn getGlobalPrivacyControl(_: *const Navigator) bool {
     return false;
 }
 
-pub fn getPlatform(_: *const Navigator) []const u8 {
+pub fn getPlatform(_: *const Navigator, exec: *const Execution) []const u8 {
+    const http_client = &exec.session.browser.http_client;
+    if (http_client.getPlatformOverride()) |platform| {
+        return platform;
+    }
+    if (http_client.isStealth()) {
+        return Config.HttpHeaders.Chrome.platform;
+    }
     return switch (builtin.target.os.tag) {
         .macos => "MacIntel",
         .windows => "Win32",
@@ -361,5 +378,6 @@ pub const JsApi = struct {
 const testing = @import("../../testing.zig");
 test "WebApi: Navigator" {
     try testing.htmlRunner("navigator", .{});
+    try testing.htmlRunner("navigator_stealth.html", .{ .stealth = true });
     try testing.htmlRunner("beacon.html", .{ .load_resources = .{ .beacon = true, .iframe = true } });
 }
