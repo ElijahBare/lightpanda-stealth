@@ -146,6 +146,10 @@ pub const Lookup = struct {
         return null;
     }
 
+    pub fn iterator(self: *const Lookup) std.StringHashMapUnmanaged([]const u8).Iterator {
+        return self._data.iterator();
+    }
+
     pub fn getLength(self: *const Lookup) u32 {
         return @intCast(self._data.count());
     }
