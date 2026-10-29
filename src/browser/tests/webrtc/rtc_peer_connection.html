@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<script>
+  // An IPv4/IPv6 literal anywhere in a candidate or SDP connection data
+  // (other than the placeholder 0.0.0.0 / loopback o= line) is a leak.
+  function leakedAddresses(text) {
+    const out = [];
+    for (const line of text.split(/\r?\n/)) {
+      if (line.startsWith('o=') || line.startsWith('c=IN IP4 0.0.0.0') || line.startsWith('a=rtcp:9 IN IP4 0.0.0.0')) {
+        continue;
+      }
+      for (const m of line.matchAll(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/g)) out.push(m[1]);
+      if (/candidate:/.test(line) && /\s[0-9a-f]*:[0-9a-f:]+\s\d+\styp/i.test(line)) out.push(line);
+    }
+    return out;
+  }
+  const MDNS = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.local$/;
+</script>
+
+<script id=presence>
+  for (const name of ['RTCPeerConnection', 'RTCSessionDescription', 'RTCIceCandidate', 'RTCDataChannel', 'RTCPeerConnectionIceEvent']) {
+    testing.expectEqual('function', typeof window[name]);
+    testing.expectEqual(`function ${name}() { [native code] }`, Function.prototype.toString.call(window[name]));
+  }
+  testing.expectTrue(RTCPeerConnection.prototype instanceof EventTarget);
+  testing.expectTrue(RTCDataChannel.prototype instanceof EventTarget);
+  testing.expectTrue(RTCPeerConnectionIceEvent.prototype instanceof Event);
+  testing.expectTrue(Function.prototype.toString.call(RTCPeerConnection.prototype.createOffer).includes('[native code]'));
+  testing.expectTrue(Function.prototype.toString.call(RTCPeerConnection.prototype.createDataChannel).includes('[native code]'));
+  testing.expectError('TypeError', () => new RTCDataChannel());
+  testing.expectError('TypeError', () => RTCPeerConnection());
+</script>
+
+<script id=constructor>
+  {
+    const pc = new RTCPeerConnection();
+    testing.expectEqual('[object RTCPeerConnection]', Object.prototype.toString.call(pc));
+    testing.expectEqual('stable', pc.signalingState);
+    testing.expectEqual('new', pc.iceGatheringState);
+    testing.expectEqual('new', pc.iceConnectionState);
+    testing.expectEqual('new', pc.connectionState);
+    testing.expectEqual(null, pc.localDescription);
+    testing.expectEqual(null, pc.remoteDescription);
+    testing.expectEqual(null, pc.canTrickleIceCandidates);
+    testing.expectEqual(null, pc.onicecandidate);
+    testing.expectEqual([], pc.getSenders());
+    testing.expectEqual([], pc.getTransceivers());
+    const config = pc.getConfiguration();
+    testing.expectEqual('all', config.iceTransportPolicy);
+    testing.expectEqual('balanced', config.bundlePolicy);
+    testing.expectEqual('require', config.rtcpMuxPolicy);
+    testing.expectEqual([], config.iceServers);
+    pc.close();
+  }
+  {
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: ['turn:turn.example.com:3478', 'turns:turn.example.com:5349'], username: 'u', credential: 'p' },
+      ],
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle',
+      someUnknownMember: 1,
+    });
+    const config = pc.getConfiguration();
+    testing.expectEqual('max-bundle', config.bundlePolicy);
+    testing.expectEqual(2, config.iceServers.length);
+    testing.expectEqual(['stun:stun.l.google.com:19302'], config.iceServers[0].urls);
+    testing.expectEqual(['turn:turn.example.com:3478', 'turns:turn.example.com:5349'], config.iceServers[1].urls);
+    testing.expectEqual('u', config.iceServers[1].username);
+    pc.close();
+  }
+  testing.expectError('SyntaxError', () => new RTCPeerConnection({ iceServers: [{ urls: 'http://example.com' }] }));
+  testing.expectError('InvalidAccessError', () => new RTCPeerConnection({ iceServers: [{ urls: 'turn:turn.example.com' }] }));
+  testing.expectError('TypeError', () => new RTCPeerConnection({ iceTransportPolicy: 'bogus' }));
+</script>
+
+<script id=session_description>
+  {
+    const desc = new RTCSessionDescription({ type: 'offer', sdp: 'v=0\r\n' });
+    testing.expectEqual('offer', desc.type);
+    testing.expectEqual('v=0\r\n', desc.sdp);
+    testing.expectEqual({ type: 'offer', sdp: 'v=0\r\n' }, desc.toJSON());
+    testing.expectEqual('', new RTCSessionDescription({ type: 'answer' }).sdp);
+  }
+  testing.expectError('TypeError', () => new RTCSessionDescription({ type: 'bogus' }));
+</script>
+
+<script id=ice_candidate>
+  {
+    const c = new RTCIceCandidate({
+      candidate: 'candidate:842163049 1 udp 1677729535 203.0.113.7 47321 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag abcd network-cost 999',
+      sdpMid: '0',
+      sdpMLineIndex: 0,
+    });
+    testing.expectEqual('842163049', c.foundation);
+    testing.expectEqual('rtp', c.component);
+    testing.expectEqual('udp', c.protocol);
+    testing.expectEqual(1677729535, c.priority);
+    testing.expectEqual('203.0.113.7', c.address);
+    testing.expectEqual(47321, c.port);
+    testing.expectEqual('srflx', c.type);
+    testing.expectEqual('0.0.0.0', c.relatedAddress);
+    testing.expectEqual(0, c.relatedPort);
+    testing.expectEqual('abcd', c.usernameFragment);
+    testing.expectEqual(null, c.tcpType);
+    testing.expectEqual('0', c.toJSON().sdpMid);
+  }
+  {
+    const c = new RTCIceCandidate({ candidate: '', sdpMid: '0' });
+    testing.expectEqual('', c.candidate);
+    testing.expectEqual(null, c.address);
+    testing.expectEqual(null, c.sdpMLineIndex);
+  }
+  testing.expectError('TypeError', () => new RTCIceCandidate());
+  testing.expectError('TypeError', () => new RTCIceCandidate({ candidate: 'candidate:1 1 udp 1 1.2.3.4 1 typ host' }));
+</script>
+
+<script id=data_channel>
+  {
+    const pc = new RTCPeerConnection();
+    const dc = pc.createDataChannel('probe');
+    testing.expectTrue(dc instanceof RTCDataChannel);
+    testing.expectEqual('[object RTCDataChannel]', Object.prototype.toString.call(dc));
+    testing.expectEqual('probe', dc.label);
+    testing.expectEqual('connecting', dc.readyState);
+    testing.expectEqual(true, dc.ordered);
+    testing.expectEqual(false, dc.negotiated);
+    testing.expectEqual(null, dc.id);
+    testing.expectEqual(null, dc.maxRetransmits);
+    testing.expectEqual('', dc.protocol);
+    testing.expectEqual(0, dc.bufferedAmount);
+    testing.expectEqual('arraybuffer', dc.binaryType);
+    dc.binaryType = 'blob';
+    testing.expectEqual('blob', dc.binaryType);
+    dc.binaryType = 'nope';
+    testing.expectEqual('blob', dc.binaryType);
+    testing.expectError('InvalidStateError', () => dc.send('x'));
+
+    const neg = pc.createDataChannel('n', { negotiated: true, id: 7, maxRetransmits: 3, protocol: 'p' });
+    testing.expectEqual(7, neg.id);
+    testing.expectEqual(3, neg.maxRetransmits);
+    testing.expectEqual('p', neg.protocol);
+    testing.expectError('TypeError', () => pc.createDataChannel('x', { maxRetransmits: 1, maxPacketLifeTime: 1 }));
+    testing.expectError('TypeError', () => pc.createDataChannel('x', { negotiated: true }));
+
+    pc.close();
+    testing.expectEqual('closed', pc.signalingState);
+    testing.expectEqual('closed', pc.connectionState);
+    testing.expectEqual('closed', pc.iceConnectionState);
+    testing.expectEqual('closed', dc.readyState);
+    testing.expectError('InvalidStateError', () => pc.createDataChannel('late'));
+    pc.close();
+  }
+</script>
+
+<script id=data_channel_close type=module>
+  {
+    const state = await testing.async();
+    const pc = new RTCPeerConnection();
+    const dc = pc.createDataChannel('c');
+    const seen = [];
+    dc.onclose = () => { seen.push(dc.readyState); state.resolve(); };
+    dc.close();
+    seen.push(dc.readyState);
+    await state.done(() => {
+      testing.expectEqual(['closing', 'closed'], seen);
+    });
+  }
+</script>
+
+<script id=offer_and_ice type=module>
+  {
+    const state = await testing.async();
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const events = [];
+    const candidates = [];
+    pc.onnegotiationneeded = () => events.push('negotiationneeded');
+    pc.onsignalingstatechange = () => events.push('signaling:' + pc.signalingState);
+    pc.onicegatheringstatechange = () => events.push('gathering:' + pc.iceGatheringState);
+    pc.onicecandidate = (e) => {
+      testing.expectTrue(e instanceof RTCPeerConnectionIceEvent);
+      candidates.push(e.candidate);
+      if (e.candidate === null) state.resolve();
+    };
+    pc.createDataChannel('');
+
+    const offer = await pc.createOffer();
+    testing.expectTrue(offer instanceof RTCSessionDescription);
+    testing.expectEqual('offer', offer.type);
+    testing.expectEqual('new', pc.iceGatheringState);
+    await pc.setLocalDescription(offer);
+    testing.expectEqual('have-local-offer', pc.signalingState);
+    testing.expectEqual('offer', pc.localDescription.type);
+    testing.expectEqual(pc.localDescription, pc.pendingLocalDescription);
+    testing.expectEqual(null, pc.currentLocalDescription);
+
+    await state.done(() => {
+      testing.expectTrue(offer.sdp.startsWith('v=0\r\no=- '));
+      testing.expectTrue(offer.sdp.includes('\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n'));
+      testing.expectTrue(/\r\na=ice-ufrag:[A-Za-z0-9+\/]{4}\r\n/.test(offer.sdp));
+      testing.expectTrue(/\r\na=ice-pwd:[A-Za-z0-9+\/]{24}\r\n/.test(offer.sdp));
+      testing.expectTrue(/\r\na=fingerprint:sha-256 ([0-9A-F]{2}:){31}[0-9A-F]{2}\r\n/.test(offer.sdp));
+      testing.expectTrue(offer.sdp.includes('\r\na=setup:actpass\r\na=mid:0\r\n'));
+      testing.expectTrue(offer.sdp.endsWith('\r\n'));
+
+      // createOffer resolves without a task hop, so the negotiationneeded
+      // task finds the connection no longer stable and is dropped.
+      testing.expectEqual(['signaling:have-local-offer', 'gathering:gathering', 'gathering:complete'], events);
+      testing.expectEqual('complete', pc.iceGatheringState);
+      testing.expectEqual(null, candidates[candidates.length - 1]);
+
+      const real = candidates.filter((c) => c !== null);
+      testing.expectEqual(1, real.length);
+      for (const c of real) {
+        testing.expectEqual('host', c.type);
+        testing.expectEqual('tcp', c.protocol);
+        testing.expectTrue(MDNS.test(c.address));
+        testing.expectEqual('0', c.sdpMid);
+        testing.expectEqual(0, c.sdpMLineIndex);
+        testing.expectEqual([], leakedAddresses(c.candidate));
+      }
+      testing.expectEqual(0, candidates.filter((c) => c && (c.type === 'srflx' || c.type === 'relay' || c.type === 'prflx')).length);
+
+      // the gathered candidate is in localDescription, and no IP is.
+      const sdp = pc.localDescription.sdp;
+      testing.expectTrue(sdp.includes('a=' + real[0].candidate + '\r\n'));
+      testing.expectEqual([], leakedAddresses(sdp));
+      pc.close();
+    });
+  }
+</script>
+
+<script id=negotiation_needed type=module>
+  {
+    const state = await testing.async();
+    const pc = new RTCPeerConnection();
+    let count = 0;
+    pc.onnegotiationneeded = () => { count += 1; setTimeout(() => state.resolve(), 5); };
+    pc.createDataChannel('a');
+    pc.createDataChannel('b');
+    await state.done(() => {
+      testing.expectEqual(1, count);
+      pc.close();
+    });
+  }
+</script>
+
+<script id=relay_only type=module>
+  {
+    const state = await testing.async();
+    const pc = new RTCPeerConnection({ iceTransportPolicy: 'relay' });
+    const candidates = [];
+    pc.onicecandidate = (e) => {
+      candidates.push(e.candidate);
+      if (e.candidate === null) state.resolve();
+    };
+    pc.createDataChannel('x');
+    await pc.setLocalDescription(await pc.createOffer());
+    await state.done(() => {
+      testing.expectEqual([null], candidates);
+      testing.expectEqual('complete', pc.iceGatheringState);
+    });
+  }
+</script>
+
+<script id=legacy_offer_options type=module>
+  {
+    const state = await testing.async();
+    const pc = new RTCPeerConnection();
+    pc.addEventListener('icecandidate', (e) => {
+      if (e.candidate === null) state.resolve();
+    });
+    const offer = await pc.createOffer({ offerToReceiveAudio: 1, offerToReceiveVideo: true });
+    await pc.setLocalDescription(offer);
+    await state.done(() => {
+      testing.expectTrue(offer.sdp.includes('a=group:BUNDLE 0 1\r\n'));
+      testing.expectTrue(offer.sdp.includes('\r\nm=audio 9 UDP/TLS/RTP/SAVPF '));
+      testing.expectTrue(offer.sdp.includes('\r\nm=video 9 UDP/TLS/RTP/SAVPF '));
+      testing.expectEqual([], leakedAddresses(pc.localDescription.sdp));
+    });
+  }
+</script>
+
+<script id=no_media_no_gathering type=module>
+  {
+    const state = await testing.async();
+    const pc = new RTCPeerConnection();
+    let fired = false;
+    pc.onicegatheringstatechange = () => { fired = true; };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    setTimeout(() => state.resolve(), 10);
+    await state.done(() => {
+      testing.expectFalse(offer.sdp.includes('m='));
+      testing.expectEqual('new', pc.iceGatheringState);
+      testing.expectFalse(fired);
+    });
+  }
+</script>
+
+<script id=offer_answer type=module>
+  {
+    const state = await testing.async();
+    const a = new RTCPeerConnection();
+    const b = new RTCPeerConnection();
+    a.createDataChannel('chat');
+    const errors = [];
+
+    await b.createAnswer().catch((e) => errors.push(e.name));
+    await b.addIceCandidate({ candidate: '', sdpMid: '0' }).catch((e) => errors.push(e.name));
+    await b.setRemoteDescription({ type: 'answer', sdp: 'v=0\r\n' }).catch((e) => errors.push(e.name));
+    await b.setRemoteDescription({ type: 'offer', sdp: 'garbage' }).catch((e) => errors.push(e.name));
+
+    const offer = await a.createOffer();
+    await a.setLocalDescription(offer);
+    await b.setRemoteDescription(offer);
+    const b_state = b.signalingState;
+    const answer = await b.createAnswer();
+    await b.setLocalDescription(answer);
+    await a.setRemoteDescription(answer);
+    await b.addIceCandidate(null);
+
+    // implicit setLocalDescription and rollback
+    const c = new RTCPeerConnection();
+    c.createDataChannel('x');
+    await c.setLocalDescription();
+    const c_type = c.localDescription.type;
+    await c.setLocalDescription({ type: 'rollback' });
+    const c_after = c.signalingState;
+
+    a.close();
+    await a.createOffer().catch((e) => errors.push(e.name));
+    await a.setLocalDescription(offer).catch((e) => errors.push(e.name));
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(['InvalidStateError', 'InvalidStateError', 'InvalidStateError', 'OperationError', 'InvalidStateError', 'InvalidStateError'], errors);
+      testing.expectEqual('have-remote-offer', b_state);
+      testing.expectEqual('answer', answer.type);
+      testing.expectTrue(answer.sdp.includes('\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n'));
+      testing.expectTrue(answer.sdp.includes('\r\na=setup:active\r\n'));
+      testing.expectEqual('stable', b.signalingState);
+      testing.expectEqual('answer', b.currentLocalDescription.type);
+      testing.expectEqual('offer', b.currentRemoteDescription.type);
+      testing.expectEqual(null, b.pendingRemoteDescription);
+      testing.expectEqual(true, b.canTrickleIceCandidates);
+      testing.expectEqual('closed', a.signalingState);
+      testing.expectEqual('offer', c_type);
+      testing.expectEqual('stable', c_after);
+      testing.expectEqual(null, c.localDescription);
+      b.close();
+      c.close();
+    });
+  }
+</script>
+
+<script id=ice_event_constructor>
+  {
+    const e = new RTCPeerConnectionIceEvent('icecandidate');
+    testing.expectEqual(null, e.candidate);
+    testing.expectEqual(false, e.isTrusted);
+    const c = new RTCIceCandidate({ candidate: '', sdpMLineIndex: 0 });
+    const e2 = new RTCPeerConnectionIceEvent('icecandidate', { candidate: c });
+    testing.expectEqual(c, e2.candidate);
+  }
+</script>

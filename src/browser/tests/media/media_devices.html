@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<meta name=lp-mode content=test>
+<script src="../testing.js"></script>
+
+<script id=presence>
+  testing.expectEqual('function', typeof MediaDevices);
+  testing.expectEqual('function', typeof MediaDeviceInfo);
+  testing.expectEqual('function MediaDevices() { [native code] }', Function.prototype.toString.call(MediaDevices));
+  testing.expectTrue(navigator.mediaDevices instanceof MediaDevices);
+  testing.expectTrue(navigator.mediaDevices instanceof EventTarget);
+  testing.expectEqual(navigator.mediaDevices, navigator.mediaDevices);
+  testing.expectEqual('[object MediaDevices]', Object.prototype.toString.call(navigator.mediaDevices));
+  testing.expectTrue(Function.prototype.toString.call(navigator.mediaDevices.enumerateDevices).includes('[native code]'));
+  testing.expectTrue('mediaDevices' in Navigator.prototype);
+  testing.expectError('TypeError', () => new MediaDevices());
+  testing.expectError('TypeError', () => new MediaDeviceInfo());
+
+  const constraints = navigator.mediaDevices.getSupportedConstraints();
+  testing.expectEqual(true, constraints.deviceId);
+  testing.expectEqual(true, constraints.echoCancellation);
+</script>
+
+<script id=enumerate type=module>
+  {
+    const state = await testing.async();
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const errors = [];
+    await navigator.mediaDevices.getUserMedia({ audio: true }).catch((e) => errors.push(e.name));
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual(['audioinput', 'videoinput', 'audiooutput'], devices.map((d) => d.kind));
+      for (const d of devices) {
+        testing.expectTrue(d instanceof MediaDeviceInfo);
+        testing.expectEqual('', d.deviceId);
+        testing.expectEqual('', d.label);
+        testing.expectEqual('', d.groupId);
+        testing.expectEqual({ deviceId: '', kind: d.kind, label: '', groupId: '' }, d.toJSON());
+      }
+      testing.expectEqual(['NotAllowedError'], errors);
+    });
+  }
+</script>
+
+<script id=hidden_outside_secure_context type=module>
+  // data: has an opaque origin, so it isn't a secure context
+  {
+    const state = await testing.async();
+    window.addEventListener('message', (e) => state.resolve(e.data));
+
+    const f = document.createElement('iframe');
+    f.src = "data:text/html,<script>parent.postMessage({secure: isSecureContext, nav: 'mediaDevices' in navigator, exposed: ['MediaDevices', 'MediaDeviceInfo', 'RTCPeerConnection'].filter((n) => n in window)}, '*')<\/script>";
+    document.body.appendChild(f);
+
+    await state.done((data) => {
+      testing.expectEqual(false, data.secure);
+      testing.expectEqual(false, data.nav);
+      // RTCPeerConnection is not [SecureContext]
+      testing.expectEqual(['RTCPeerConnection'], data.exposed);
+    });
+  }
+</script>

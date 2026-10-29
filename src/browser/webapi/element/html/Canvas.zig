@@ -93,7 +93,9 @@ fn getContext(self: *Canvas, context_type: []const u8, frame: *Frame) !?DrawingC
         // worlds: pages that have an error boundary above the WebGL widget
         // catch the throw, reset, re-render, and loop forever.
         // Spec-correct signal for "no WebGL" is null, so apps that check
-        // (Three.js does) can degrade gracefully.
+        // (Three.js does) can degrade gracefully. It's also exactly what
+        // Chrome does under --disable-webgl: WebGLRenderingContext and
+        // WebGL2RenderingContext stay on window, getContext returns null.
         if (isWebGL(context_type)) {
             frame.page.status.noteUnsupported(.webgl);
         }

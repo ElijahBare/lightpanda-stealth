@@ -32,6 +32,7 @@ const NavigatorUAData = @import("NavigatorUAData.zig");
 const Geolocation = @import("geolocation/Geolocation.zig");
 const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
 const LockManager = @import("LockManager.zig");
+const MediaDevices = @import("media/MediaDevices.zig");
 
 const Execution = js.Execution;
 const resource_load = Frame.resource_load;
@@ -55,6 +56,7 @@ _ua_data: NavigatorUAData = .{},
 _service_worker: ?*ServiceWorkerContainer = null,
 _locks: ?*LockManager = null,
 _beacon_bytes: ?*usize = null,
+_media_devices: ?*MediaDevices = null,
 
 pub const init: Navigator = .{};
 
@@ -233,6 +235,17 @@ fn getServiceWorker(self: *Navigator, frame: *Frame) !*ServiceWorkerContainer {
     return sw;
 }
 
+// [SecureContext]: removed at runtime on insecure frames
+// (Env.hideSecureContextInterfaces).
+fn getMediaDevices(self: *Navigator, exec: *Execution) !*MediaDevices {
+    if (self._media_devices) |m| {
+        return m;
+    }
+    const m = try MediaDevices.init(exec);
+    self._media_devices = m;
+    return m;
+}
+
 fn getLocks(self: *Navigator, exec: *Execution) !*LockManager {
     if (self._locks) |l| {
         return l;
@@ -353,6 +366,7 @@ pub const JsApi = struct {
     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
     pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{});
     pub const geolocation = bridge.accessor(Navigator.getGeolocation, null, .{});
+    pub const mediaDevices = bridge.accessor(Navigator.getMediaDevices, null, .{});
     pub const modelContext = bridge.accessor(Navigator.getModelContext, null, .{});
     pub const registerProtocolHandler = bridge.function(Navigator.registerProtocolHandler, .{});
     pub const unregisterProtocolHandler = bridge.function(Navigator.unregisterProtocolHandler, .{});

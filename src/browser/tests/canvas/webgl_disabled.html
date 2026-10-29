@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<script src="../testing.js"></script>
+
+<!-- Like Chrome with --disable-webgl: the interfaces exist, no context does. -->
+<script id=interfaces>
+  for (const name of ['WebGLRenderingContext', 'WebGL2RenderingContext']) {
+    testing.expectEqual('function', typeof window[name]);
+    testing.expectEqual(`function ${name}() { [native code] }`, Function.prototype.toString.call(window[name]));
+    testing.expectEqual('function', typeof window[name].prototype.getParameter);
+    testing.expectError('TypeError', () => new window[name]());
+  }
+</script>
+
+<script id=get_context>
+  {
+    const canvas = document.createElement('canvas');
+    for (const type of ['webgl', 'webgl2', 'experimental-webgl', 'experimental-webgl2']) {
+      testing.expectEqual(null, canvas.getContext(type));
+    }
+    // a failed WebGL request doesn't lock the canvas into a mode
+    testing.expectTrue(canvas.getContext('2d') instanceof CanvasRenderingContext2D);
+    testing.expectEqual(null, canvas.getContext('webgl'));
+  }
+  {
+    const offscreen = new OffscreenCanvas(10, 10);
+    testing.expectEqual(null, offscreen.getContext('webgl'));
+    testing.expectEqual(null, offscreen.getContext('webgl2'));
+  }
+</script>
