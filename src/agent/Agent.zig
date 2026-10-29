@@ -384,9 +384,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
 
     try self.ts.init(app);
     errdefer self.ts.deinit();
-    if (app.config.profileDir()) |profile_dir| {
-        lp.profile.load(self.ts.session, profile_dir);
-    }
+    loadProfile(&self.ts);
 
     self.ai_client = if (self.credential) |*c| try zenai.provider.Client.init(lp.io, allocator, c.provider, c.keySlice(), .{ .base_url = opts.base_url, .retry_policy = .long_running, .bill_to = hfBillTo(c.provider), .environ = lp.environ(), .account_id = c.accountId() }) else null;
     errdefer if (self.ai_client) |c| c.deinit(allocator);
@@ -919,15 +917,33 @@ fn handleClear(self: *Agent) void {
 }
 
 /// Full clean slate: everything `/clear` drops, plus a fresh browser session,
-/// so the loaded page, cookies, storage, and history are gone too.
+/// so the loaded page, cookies, storage, and history are gone too. With
+/// --profile-dir, the fresh session starts from the profile, as at startup.
 fn handleReset(self: *Agent) void {
-    self.ts.restartSession() catch |err| {
+    restartBrowserSession(&self.ts) catch |err| {
         self.terminal.printError("reset failed: {s}", .{@errorName(err)});
         return;
     };
     self.installSessionHooks();
     self.clearConversation();
-    self.terminal.printInfo("Reset conversation and browser session. Page, cookies, and storage cleared.", .{});
+    if (self.ts.browser.app.config.profileDir() != null) {
+        self.terminal.printInfo("Reset conversation and browser session. Page cleared; cookies and storage reloaded from --profile-dir.", .{});
+    } else {
+        self.terminal.printInfo("Reset conversation and browser session. Page, cookies, and storage cleared.", .{});
+    }
+}
+
+/// Replaces the browser session with a fresh one loaded from --profile-dir.
+/// Without the reload, exit would save the empty session over the profile.
+fn restartBrowserSession(ts: *lp.ToolSession) !void {
+    try ts.restartSession();
+    loadProfile(ts);
+}
+
+fn loadProfile(ts: *lp.ToolSession) void {
+    if (ts.browser.app.config.profileDir()) |profile_dir| {
+        lp.profile.load(ts.session, profile_dir);
+    }
 }
 
 fn handleLoad(self: *Agent, rest: []const u8) void {
@@ -2378,4 +2394,34 @@ test "pinArgs: the result outlives the model's args" {
 
     try std.testing.expectEqualStrings("#email", out.object.get("selector").?.string);
     try std.testing.expectEqualStrings("$LP_EMAIL", out.object.get("value").?.string);
+}
+
+test "Agent: /reset reloads --profile-dir instead of dropping it" {
+    const testing = @import("../testing.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testing.tmpPath(&tmp, "profile");
+
+    const opts = &testing.test_config.mode.serve;
+    defer opts.profile_dir = null;
+    opts.profile_dir = path;
+
+    var ts: lp.ToolSession = undefined;
+    try ts.init(testing.test_app);
+    defer ts.deinit();
+
+    // A profile saved by an earlier run.
+    try ts.session.cookie_jar.populateFromResponse("https://example.com/", "sid=abc; Path=/; Max-Age=3600");
+    lp.profile.save(ts.session, path);
+
+    try restartBrowserSession(&ts);
+    try std.testing.expectEqual(1, ts.session.cookie_jar.len);
+
+    // What changes after the reset is saved on top of the reloaded state.
+    try ts.session.cookie_jar.populateFromResponse("https://example.com/", "pref=1; Path=/; Max-Age=3600");
+    lp.profile.save(ts.session, path);
+
+    try restartBrowserSession(&ts);
+    try std.testing.expectEqual(2, ts.session.cookie_jar.len);
 }
