@@ -52,6 +52,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         close,
         captureScreenshot,
         printToPDF,
+        captureSnapshot,
         getLayoutMetrics,
         handleJavaScriptDialog,
         setBypassCSP,
@@ -74,6 +75,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .close => return close(cmd),
         .captureScreenshot => return captureScreenshot(cmd),
         .printToPDF => return printToPDF(cmd),
+        .captureSnapshot => return captureSnapshot(cmd),
         .getLayoutMetrics => return getLayoutMetrics(cmd),
         .handleJavaScriptDialog => return handleJavaScriptDialog(cmd),
         // CSP isn't enforced, there is a single page, and no file chooser
@@ -1191,6 +1193,24 @@ fn printToPDF(cmd: *CDP.Command) !void {
     }, .{});
 }
 
+// https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-captureSnapshot
+fn captureSnapshot(cmd: *CDP.Command) !void {
+    const Params = struct {
+        format: []const u8 = "mhtml",
+    };
+    const params = try cmd.params(Params) orelse Params{};
+    if (!std.mem.eql(u8, params.format, "mhtml")) {
+        return cmd.sendError(-32000, "Unsupported snapshot format", .{});
+    }
+
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+
+    var aw: std.Io.Writer.Allocating = .init(cmd.arena);
+    try lp.mhtml.write(cmd.arena, frame, &aw.writer);
+    return cmd.sendResult(.{ .data = aw.written() }, .{});
+}
+
 fn getLayoutMetrics(cmd: *CDP.Command) !void {
     // The viewport override lives on the Browser, so read it there directly:
     // it stays correct even when no page is currently loaded.
@@ -2203,6 +2223,69 @@ fn ioReadResult(ctx: *testing.TestContext, msg_id: i64, expect_eof: bool) ![]con
         const out = try testing.arena_allocator.alloc(u8, try decoder.calcSizeForSlice(data));
         try decoder.decode(out, data);
         return out;
+    }
+    return error.ResultNotFound;
+}
+
+test "cdp.frame: captureSnapshot" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-9", .url = "cdp/snapshot.html", .target_id = "FID-000000000X".* });
+
+    {
+        try ctx.processMessage(.{ .id = 10, .method = "Page.captureSnapshot", .params = .{ .format = "html" } });
+        try ctx.expectSentError(-32000, "Unsupported snapshot format", .{ .id = 10 });
+    }
+
+    try ctx.processMessage(.{ .id = 11, .method = "Page.captureSnapshot" });
+    const mhtml = try snapshotResult(&ctx, 11);
+    const url = "http://127.0.0.1:9582/src/browser/tests/cdp/snapshot.html";
+
+    // Message header, ended by an empty line.
+    const header_end = std.mem.find(u8, mhtml, "\r\n\r\n").?;
+    const header = mhtml[0..header_end];
+    try testing.expectEqual(true, std.mem.startsWith(u8, header, "From: <Saved by Lightpanda>\r\n"));
+    try testing.expectEqual(true, std.mem.find(u8, header, "\r\nSnapshot-Content-Location: " ++ url ++ "\r\n") != null);
+    try testing.expectEqual(true, std.mem.find(u8, header, "\r\nSubject: =?utf-8?Q?Snap_=3D_Caf=C3=A9?=\r\n") != null);
+    try testing.expectEqual(true, std.mem.find(u8, header, "\r\nDate: ") != null);
+    try testing.expectEqual(true, std.mem.find(u8, header, "\r\nMIME-Version: 1.0\r\n") != null);
+    try testing.expectEqual(true, std.mem.find(u8, header, "\r\nContent-Type: multipart/related;\r\n\ttype=\"text/html\";\r\n\tboundary=\"") != null);
+
+    const boundary_start = std.mem.find(u8, header, "boundary=\"").? + "boundary=\"".len;
+    const boundary = header[boundary_start .. header.len - 1];
+    try testing.expectEqual(true, std.mem.startsWith(u8, boundary, "----MultipartBoundary--"));
+
+    const delimiter = try std.fmt.allocPrint(testing.arena_allocator, "\r\n--{s}\r\n", .{boundary});
+    const closing = try std.fmt.allocPrint(testing.arena_allocator, "\r\n--{s}--\r\n", .{boundary});
+    try testing.expectEqual(true, std.mem.endsWith(u8, mhtml, closing));
+
+    // Main frame first, then the iframe's document.
+    var parts = std.mem.splitSequence(u8, mhtml[header_end .. mhtml.len - closing.len], delimiter);
+    _ = parts.next(); // preamble
+    const main = parts.next().?;
+    const child = parts.next().?;
+    try testing.expectEqual(null, parts.next());
+
+    try testing.expectEqual(true, std.mem.startsWith(u8, main, "Content-Type: text/html; charset=utf-8\r\n"));
+    try testing.expectEqual(true, std.mem.find(u8, main, "\r\nContent-Transfer-Encoding: quoted-printable\r\n") != null);
+    try testing.expectEqual(true, std.mem.find(u8, main, "\r\nContent-Location: " ++ url ++ "\r\n\r\n") != null);
+    try testing.expectEqual(true, std.mem.find(u8, main, "<!DOCTYPE html>") != null);
+    try testing.expectEqual(true, std.mem.find(u8, main, "<p id=3D\"greeting\">caf=C3=A9 =3D cr=C3=A8me</p>") != null);
+    // Long lines are soft-broken.
+    var lines = std.mem.splitSequence(u8, main, "\r\n");
+    while (lines.next()) |line| try testing.expectEqual(true, line.len <= 76);
+
+    try testing.expectEqual(true, std.mem.find(u8, child, "\r\nContent-Location: about:srcdoc\r\n") != null);
+    try testing.expectEqual(true, std.mem.find(u8, child, "<b>inner</b>") != null);
+}
+
+fn snapshotResult(ctx: *testing.TestContext, msg_id: i64) ![]const u8 {
+    var i: usize = 0;
+    while (try ctx.getSentMessage(i)) |msg| : (i += 1) {
+        const obj = msg.object;
+        const got = obj.get("id") orelse continue;
+        if (got != .integer or got.integer != msg_id) continue;
+        return obj.get("result").?.object.get("data").?.string;
     }
     return error.ResultNotFound;
 }
