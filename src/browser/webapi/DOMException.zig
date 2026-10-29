@@ -116,7 +116,7 @@ pub fn getName(self: *const DOMException) []const u8 {
     };
 }
 
-fn getMessage(self: *const DOMException) []const u8 {
+pub fn getMessage(self: *const DOMException) []const u8 {
     if (self._custom_message) |msg| {
         return msg;
     }
