@@ -82,6 +82,11 @@ browser_session_id: ?[]const u8 = null,
 browser_context: ?BrowserContext,
 disable_set_cache_disabled: bool = false,
 
+// Set by Browser.close: the result has been sent and the browser context
+// disposed. The worker sends a close frame and ends this connection on its
+// next tick. The server (and other clients) keep running.
+closing: bool = false,
+
 // Re-used arena for processing a message. Works because we strictly process
 // one message at a time.
 message_arena: std.heap.ArenaAllocator,
@@ -154,7 +159,7 @@ pub fn deinit(self: *CDP) void {
 // valid for the duration of dispatch.
 pub fn onMessage(self: *CDP, c: *Inbox.Message.Cdp) anyerror!void {
     // Once a terminate is pending, don't dispatch
-    if (self.browser.env.terminatePending()) {
+    if (self.browser.env.terminatePending() or self.closing) {
         return;
     }
 
