@@ -581,7 +581,7 @@ fn dispatch(bidi: *BiDi, frame: *Frame, source: *Source, action: *const Action) 
             pointer.last_click_x = pointer.x;
             pointer.last_click_y = pointer.y;
 
-            try user_input.triggerMousePress(frame, pointer.x, pointer.y, button, pointer.click_count);
+            try user_input.triggerMousePress(frame, pointer.x, pointer.y, button, pointer.click_count, .{});
         },
         .pointer_up => |button| {
             const pointer = &source.pointer;
@@ -590,7 +590,7 @@ fn dispatch(bidi: *BiDi, frame: *Frame, source: *Source, action: *const Action) 
             if (pointer.touch) {
                 return user_input.touchEnd(frame, .{ .x = pointer.x, .y = pointer.y }, .{});
             }
-            try user_input.triggerMouseRelease(frame, pointer.x, pointer.y, button, pointer.click_count);
+            try user_input.triggerMouseRelease(frame, pointer.x, pointer.y, button, pointer.click_count, .{});
         },
         .pointer_move => |move| {
             const pointer = &source.pointer;
@@ -601,7 +601,7 @@ fn dispatch(bidi: *BiDi, frame: *Frame, source: *Source, action: *const Action) 
                 // A finger that isn't down has nothing to move.
                 return user_input.touchMove(frame, null, .{ .x = target.x, .y = target.y }, .{});
             }
-            try user_input.triggerMouseMove(frame, target.x, target.y);
+            try user_input.triggerMouseMove(frame, target.x, target.y, .{});
         },
         .scroll => |scroll| {
             const target = try resolveOrigin(bidi, frame, source, scroll.origin, scroll.x, scroll.y);

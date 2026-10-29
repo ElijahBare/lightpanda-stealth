@@ -53,6 +53,9 @@ fn dispatchKeyEvent(cmd: *CDP.Command) !void {
         text: []const u8 = "",
         // Reported as keyCode and which by keydown and keyup, as in Chrome.
         windowsVirtualKeyCode: u32 = 0,
+        autoRepeat: bool = false,
+        isKeypad: bool = false,
+        location: ?u32 = null,
         // Many optional parameters are not implemented yet, see documentation url.
 
         const Type = enum {
@@ -80,6 +83,8 @@ fn dispatchKeyEvent(cmd: *CDP.Command) !void {
         .key = if (params.key.len > 0) params.key else params.text,
         .code = params.code,
         .keyCode = params.windowsVirtualKeyCode,
+        .location = params.location orelse keyLocation(params.code orelse "", params.isKeypad),
+        .repeat = params.autoRepeat,
         .altKey = modifiers.alt,
         .ctrlKey = modifiers.ctrl,
         .metaKey = modifiers.meta,
@@ -119,6 +124,8 @@ fn dispatchMouseEvent(cmd: *CDP.Command) !void {
         clickCount: i32 = 0,
         deltaX: f64 = 0,
         deltaY: f64 = 0,
+        modifiers: u4 = 0,
+        force: ?f64 = null,
         // Many optional parameters are not implemented yet, see documentation url.
 
         const Type = enum {
@@ -154,10 +161,14 @@ fn dispatchMouseEvent(cmd: *CDP.Command) !void {
         .forward => dom_button.fifth,
     };
 
+    const input: Frame.user_input.MouseInput = .{
+        .modifiers = cdpModifiers(params.modifiers),
+        .force = params.force,
+    };
     switch (params.type) {
-        .mousePressed => try Frame.user_input.triggerMousePress(frame, params.x, params.y, button, params.clickCount),
-        .mouseReleased => try Frame.user_input.triggerMouseRelease(frame, params.x, params.y, button, params.clickCount),
-        .mouseMoved => try Frame.user_input.triggerMouseMove(frame, params.x, params.y),
+        .mousePressed => try Frame.user_input.triggerMousePress(frame, params.x, params.y, button, params.clickCount, input),
+        .mouseReleased => try Frame.user_input.triggerMouseRelease(frame, params.x, params.y, button, params.clickCount, input),
+        .mouseMoved => try Frame.user_input.triggerMouseMove(frame, params.x, params.y, input),
         .mouseWheel => try Frame.user_input.triggerMouseWheel(frame, params.x, params.y, params.deltaX, params.deltaY),
     }
     // result already sent
@@ -271,6 +282,25 @@ fn setInterceptDrags(cmd: *CDP.Command) !void {
         bc.intercept_drags = params.enabled;
     }
     try cmd.sendResult(null, .{});
+}
+
+/// KeyboardEvent.location for a key the client sent no `location` for: what
+/// a physical keyboard reports for its `code`.
+/// https://www.w3.org/TR/uievents/#dom-keyboardevent-location
+fn keyLocation(code: []const u8, is_keypad: bool) u32 {
+    const standard = 0;
+    const left = 1;
+    const right = 2;
+    const numpad = 3;
+    if (is_keypad or std.mem.startsWith(u8, code, "Numpad")) return numpad;
+    const sides = [_][]const u8{ "Shift", "Control", "Alt", "Meta" };
+    for (sides) |side| {
+        if (!std.mem.startsWith(u8, code, side)) continue;
+        const rest = code[side.len..];
+        if (std.mem.eql(u8, rest, "Left")) return left;
+        if (std.mem.eql(u8, rest, "Right")) return right;
+    }
+    return standard;
 }
 
 fn cdpModifiers(bits: u4) Frame.user_input.Modifiers {
@@ -1428,6 +1458,385 @@ test "cdp.input: chorded mousedown focuses its target unless pointerdown or mous
         , null);
         try testing.expect(result.isTrue());
     }
+}
+
+/// Loads mcp_actions.html with two side-by-side 100x40 boxes, #a and #b (focusable),
+/// at the top of the body, and records the mouse, pointer and focus events
+/// the window sees in `window.log`, each as `type:target:isTrusted`. `run`
+/// drives the page.
+fn expectRealMouse(comptime run: fn (*testing.TestContext, *const lp.js.Local) anyerror!void) !void {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    _ = try ls.local.compileAndRun(
+        \\document.body.insertAdjacentHTML('afterbegin',
+        \\  '<div id="a" style="width: 100px; height: 40px">A</div>' +
+        \\  '<div id="b" tabindex="0" style="width: 100px; height: 40px">B</div>');
+        \\window.log = [];
+        \\window.events = [];
+        \\window.name_of = (t) => t === window ? 'window' : (t.id || t.nodeName);
+        \\for (const t of ['pointerover', 'pointerenter', 'pointerout', 'pointerleave', 'pointermove', 'pointerdown', 'pointerup',
+        \\                 'mouseover', 'mouseenter', 'mouseout', 'mouseleave', 'mousemove', 'mousedown', 'mouseup',
+        \\                 'click', 'dblclick', 'focus', 'focusin', 'blur', 'focusout']) {
+        \\  window.addEventListener(t, (e) => {
+        \\    if (e.target === window || e.target === document) return;
+        \\    log.push(`${e.type}:${name_of(e.target)}:${e.isTrusted}`);
+        \\    if (e instanceof MouseEvent) events.push(e);
+        \\  }, true);
+        \\}
+        \\window.center = (id) => { const r = document.getElementById(id).getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; };
+    , null);
+
+    try run(&ctx, &ls.local);
+}
+
+fn jsNumber(local: *const lp.js.Local, src: []const u8) !f64 {
+    return (try local.compileAndRun(src, null)).toF64();
+}
+
+fn expectJsString(local: *const lp.js.Local, src: []const u8, expected: []const u8) !void {
+    const actual = try (try local.compileAndRun(src, null)).toStringSlice();
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+/// zendriver's Tab.mouse_move: `steps` mouseMoved messages evenly spaced from
+/// the last position to (x, y), each carrying the held buttons.
+fn zendriverMove(ctx: *testing.TestContext, from_x: f64, from_y: f64, x: f64, y: f64, steps: u32, buttons: u16) !void {
+    var i: u32 = 1;
+    while (i <= steps) : (i += 1) {
+        const f: f64 = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
+        try ctx.processMessage(.{
+            .id = 100 + i,
+            .method = "Input.dispatchMouseEvent",
+            .params = .{
+                .type = "mouseMoved",
+                .x = from_x + (x - from_x) * f,
+                .y = from_y + (y - from_y) * f,
+                .modifiers = 0,
+                .button = "none",
+                .buttons = buttons,
+                .force = @as(f64, if (buttons != 0) 0.5 else 0),
+            },
+        });
+    }
+}
+
+/// zendriver's Tab.mouse_click: mouse_down then mouse_up, `buttons` and
+/// `force` following the held mask.
+fn zendriverClick(ctx: *testing.TestContext, x: f64, y: f64, modifiers: u4) !void {
+    try ctx.processMessage(.{
+        .id = 200,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = x, .y = y, .modifiers = modifiers, .button = "left", .buttons = 1, .clickCount = 1, .force = 0.5 },
+    });
+    try ctx.processMessage(.{
+        .id = 201,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseReleased", .x = x, .y = y, .modifiers = modifiers, .button = "left", .buttons = 0, .clickCount = 1, .force = 0 },
+    });
+}
+
+// The exact sequence Chrome fires for zendriver's element.mouse_move() onto
+// #a, then tab.mouse_move(steps=3) across to #b and tab.mouse_click() there:
+// every pointer boundary event before the mouse ones, one pointermove and
+// mousemove per step, and all of it trusted.
+test "cdp.input: a zendriver-style move then click fires Chrome's exact trusted sequence" {
+    try expectRealMouse(struct {
+        fn run(ctx: *testing.TestContext, local: *const lp.js.Local) !void {
+            const ax = try jsNumber(local, "center('a')[0]");
+            const ay = try jsNumber(local, "center('a')[1]");
+            const bx = try jsNumber(local, "center('b')[0]");
+            const by = try jsNumber(local, "center('b')[1]");
+            // The boxes sit side by side; the first of the three steps stays
+            // over #a.
+            try testing.expect(ax + (bx - ax) / 3 < try jsNumber(local, "document.getElementById('a').getBoundingClientRect().right"));
+
+            try zendriverMove(ctx, 0, 0, ax, ay, 1, 0);
+            try zendriverMove(ctx, ax, ay, bx, by, 3, 0);
+            try zendriverClick(ctx, bx, by, 0);
+
+            try expectJsString(local, "log.join('\\n')",
+                \\pointerover:a:true
+                \\pointerenter:HTML:true
+                \\pointerenter:BODY:true
+                \\pointerenter:a:true
+                \\mouseover:a:true
+                \\mouseenter:HTML:true
+                \\mouseenter:BODY:true
+                \\mouseenter:a:true
+                \\pointermove:a:true
+                \\mousemove:a:true
+                \\pointermove:a:true
+                \\mousemove:a:true
+                \\pointerout:a:true
+                \\pointerleave:a:true
+                \\pointerover:b:true
+                \\pointerenter:b:true
+                \\mouseout:a:true
+                \\mouseleave:a:true
+                \\mouseover:b:true
+                \\mouseenter:b:true
+                \\pointermove:b:true
+                \\mousemove:b:true
+                \\pointermove:b:true
+                \\mousemove:b:true
+                \\pointerdown:b:true
+                \\mousedown:b:true
+                \\focus:b:true
+                \\focusin:b:true
+                \\pointerup:b:true
+                \\mouseup:b:true
+                \\click:b:true
+            );
+
+            // Events a script makes stay untrusted, as in Chrome: zendriver's
+            // element.click() is a Runtime.callFunctionOn of el.click().
+            _ = try local.compileAndRun(
+                \\log.length = 0;
+                \\const b = document.getElementById('b');
+                \\b.click();
+                \\b.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                \\b.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+            , null);
+            try expectJsString(local, "log.join(',')", "click:b:false,mousedown:b:false,pointerover:b:false");
+        }
+    }.run);
+}
+
+// A press and release with no move before them still move the pointer there:
+// the boundary events fire first, with no pointermove or mousemove, as in
+// Chrome. :hover follows the pointer.
+test "cdp.input: a click without a prior mouseMoved fires the hover events first" {
+    try expectRealMouse(struct {
+        fn run(ctx: *testing.TestContext, local: *const lp.js.Local) !void {
+            const bx = try jsNumber(local, "center('b')[0]");
+            const by = try jsNumber(local, "center('b')[1]");
+            try zendriverClick(ctx, bx, by, 0);
+            try expectJsString(local, "log.join(',')", "pointerover:b:true,pointerenter:HTML:true,pointerenter:BODY:true,pointerenter:b:true," ++
+                "mouseover:b:true,mouseenter:HTML:true,mouseenter:BODY:true,mouseenter:b:true," ++
+                "pointerdown:b:true,mousedown:b:true,focus:b:true,focusin:b:true,pointerup:b:true,mouseup:b:true,click:b:true");
+
+            try expectJsString(local, "[...document.querySelectorAll(':hover')].map(name_of).join(',')", "HTML,BODY,b");
+            try expectJsString(local, "String(document.elementFromPoint(...center('b')) === document.getElementById('b'))", "true");
+
+            // A release somewhere else moves the hover there too.
+            const ax = try jsNumber(local, "center('a')[0]");
+            const ay = try jsNumber(local, "center('a')[1]");
+            _ = try local.compileAndRun("log.length = 0", null);
+            try ctx.processMessage(.{
+                .id = 1,
+                .method = "Input.dispatchMouseEvent",
+                .params = .{ .type = "mousePressed", .x = bx, .y = by, .button = "left", .clickCount = 1 },
+            });
+            try ctx.processMessage(.{
+                .id = 2,
+                .method = "Input.dispatchMouseEvent",
+                .params = .{ .type = "mouseReleased", .x = ax, .y = ay, .button = "left", .clickCount = 1 },
+            });
+            try expectJsString(local, "log.join(',')", "pointerdown:b:true,mousedown:b:true," ++
+                "pointerout:b:true,pointerleave:b:true,pointerover:a:true,pointerenter:a:true," ++
+                "mouseout:b:true,mouseleave:b:true,mouseover:a:true,mouseenter:a:true," ++
+                "pointerup:a:true,mouseup:a:true,click:BODY:true");
+            try expectJsString(local, "[...document.querySelectorAll(':hover')].map(name_of).join(',')", "HTML,BODY,a");
+            try expectJsString(local, "String(document.getElementById('a').matches(':hover') && !document.getElementById('b').matches(':hover'))", "true");
+        }
+    }.run);
+}
+
+// Coordinates, movement, buttons, pressure, detail and modifiers on each
+// event of a move, a press and a release, with the window scrolled so client
+// and page points differ.
+test "cdp.input: mouse events carry realistic, self-consistent properties" {
+    try expectRealMouse(struct {
+        fn run(ctx: *testing.TestContext, local: *const lp.js.Local) !void {
+            _ = try local.compileAndRun("window.scrollTo(0, 3)", null);
+            // #a's padding edge, which offsetX/Y count from.
+            try testing.expectEqual(0, try jsNumber(local, "document.getElementById('a').getBoundingClientRect().x"));
+            try testing.expectEqual(22, try jsNumber(local, "document.getElementById('a').getBoundingClientRect().y"));
+
+            try ctx.processMessage(.{
+                .id = 1,
+                .method = "Input.dispatchMouseEvent",
+                .params = .{ .type = "mouseMoved", .x = 10, .y = 30 },
+            });
+            try ctx.processMessage(.{
+                .id = 2,
+                .method = "Input.dispatchMouseEvent",
+                .params = .{ .type = "mouseMoved", .x = 13.5, .y = 26.25 },
+            });
+            // shift + ctrl
+            try zendriverClick(ctx, 13.5, 26.25, 8 | 2);
+
+            _ = try local.compileAndRun(
+                \\window.describe = (type) => {
+                \\  const all = events.filter((e) => e.type === type);
+                \\  const e = all[all.length - 1];
+                \\  const fields = [e.clientX, e.clientY, e.screenX, e.screenY, e.pageX, e.pageY, e.offsetX, e.offsetY,
+                \\    e.movementX, e.movementY, e.button, e.buttons, e.detail, e.shiftKey, e.ctrlKey, e.altKey, e.metaKey];
+                \\  if (e instanceof PointerEvent) fields.push(e.pointerId, e.pointerType, e.width, e.height, e.pressure, e.isPrimary);
+                \\  return fields.join(' ');
+                \\};
+            , null);
+
+            // The first message ever has nothing to move from.
+            try expectJsString(local, "describe('pointerover')", "10 30 10 30 10 33 10 8 0 0 -1 0 0 false false false false 1 mouse 1 1 0 true");
+            // The second: pointer coordinates stay fractional, mouse ones are
+            // whole, and each moves by the change in its own coordinates.
+            try expectJsString(local, "describe('pointermove')", "13.5 26.25 13.5 26.25 13.5 29.25 13.5 4.25 3.5 -3.75 -1 0 0 false false false false 1 mouse 1 1 0 true");
+            try expectJsString(local, "describe('mousemove')", "13 26 13 26 13 29 13 4 3 -4 0 0 0 false false false false");
+            try expectJsString(local, "describe('pointerdown')", "13.5 26.25 13.5 26.25 13.5 29.25 13.5 4.25 0 0 0 1 0 true true false false 1 mouse 1 1 0.5 true");
+            try expectJsString(local, "describe('mousedown')", "13 26 13 26 13 29 13 4 0 0 0 1 1 true true false false");
+            try expectJsString(local, "describe('pointerup')", "13.5 26.25 13.5 26.25 13.5 29.25 13.5 4.25 0 0 0 0 0 true true false false 1 mouse 1 1 0 true");
+            try expectJsString(local, "describe('mouseup')", "13 26 13 26 13 29 13 4 0 0 0 0 1 true true false false");
+            try expectJsString(local, "describe('click')", "13 26 13 26 13 29 13 4 0 0 0 0 1 true true false false 1 mouse 1 1 0 true");
+        }
+    }.run);
+}
+
+// While a button is held, moves report it in buttons, and pointer events a
+// pressure of 0.5 (zendriver's force), as in a zendriver mouse_drag.
+test "cdp.input: a held button shows in the buttons and pressure of moves" {
+    try expectRealMouse(struct {
+        fn run(ctx: *testing.TestContext, local: *const lp.js.Local) !void {
+            const ax = try jsNumber(local, "center('a')[0]");
+            const ay = try jsNumber(local, "center('a')[1]");
+            const bx = try jsNumber(local, "center('b')[0]");
+            const by = try jsNumber(local, "center('b')[1]");
+            try ctx.processMessage(.{
+                .id = 1,
+                .method = "Input.dispatchMouseEvent",
+                .params = .{ .type = "mousePressed", .x = ax, .y = ay, .button = "left", .buttons = 1, .clickCount = 1, .force = 0.5 },
+            });
+            try zendriverMove(ctx, ax, ay, bx, by, 1, 1);
+            try expectJsString(local, "events.filter((e) => e.type.startsWith('pointer') && e.type !== 'pointerdown' && e.target.id === 'b').map((e) => `${e.type}:${e.buttons}:${e.pressure}`).join(',')", "pointerover:1:0.5,pointerenter:1:0.5,pointermove:1:0.5");
+            try expectJsString(local, "events.filter((e) => e.type === 'mousemove').map((e) => `${e.buttons}:${e.button}`).join(',')", "1:0");
+        }
+    }.run);
+}
+
+/// Loads mcp_actions.html, focuses #inp and records the keyboard and input
+/// events it sees in `window.log`.
+fn expectRealKeys(comptime run: fn (*testing.TestContext, *const lp.js.Local) anyerror!void) !void {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    _ = try ls.local.compileAndRun(
+        \\window.log = [];
+        \\const inp = document.getElementById('inp');
+        \\for (const t of ['keydown', 'keypress', 'beforeinput', 'input', 'keyup']) {
+        \\  inp.addEventListener(t, (e) => log.push(e instanceof KeyboardEvent
+        \\    ? `${e.type}:${e.key}:${e.code}:${e.keyCode}:${e.which}:${e.charCode}:${e.location}:${e.repeat}:${e.shiftKey}:${e.isTrusted}`
+        \\    : `${e.type}:${e.inputType}:${e.data}:${e.isTrusted}`));
+        \\}
+        \\inp.focus();
+    , null);
+
+    try run(&ctx, &ls.local);
+}
+
+// zendriver's element.send_keys("Hi!") sends one `char` per character, with
+// only the text: Chrome fires keypress, beforeinput and input for each, and
+// the text lands in the field.
+test "cdp.input: zendriver send_keys text types into the focused input" {
+    try expectRealKeys(struct {
+        fn run(ctx: *testing.TestContext, local: *const lp.js.Local) !void {
+            for ([_][]const u8{ "H", "i", "!" }, 0..) |c, i| {
+                try ctx.processMessage(.{
+                    .id = i + 1,
+                    .method = "Input.dispatchKeyEvent",
+                    .params = .{ .type = "char", .modifiers = 0, .text = c },
+                });
+            }
+            try expectJsString(local, "inp.value", "Hi!");
+            try expectJsString(local, "log.join('\\n')",
+                \\keypress:H::72:72:72:0:false:false:true
+                \\beforeinput:insertText:H:true
+                \\input:insertText:H:true
+                \\keypress:i::105:105:105:0:false:false:true
+                \\beforeinput:insertText:i:true
+                \\input:insertText:i:true
+                \\keypress:!::33:33:33:0:false:false:true
+                \\beforeinput:insertText:!:true
+                \\input:insertText:!:true
+            );
+
+            // Input.insertText fires no key events, only a trusted edit.
+            _ = try local.compileAndRun("log.length = 0", null);
+            try ctx.processMessage(.{ .id = 10, .method = "Input.insertText", .params = .{ .text = "yo" } });
+            try expectJsString(local, "inp.value", "Hi!yo");
+            try expectJsString(local, "log.join(',')", "beforeinput:insertText:yo:true,input:insertText:yo:true");
+        }
+    }.run);
+}
+
+// zendriver's send_keys for a key with modifiers (KeyEvents("A") as
+// DOWN_AND_UP): Shift down, the key down with its text, then both up, each
+// with code and virtual key code. Shift reports its side as its location,
+// the keypad its own, and autoRepeat sets repeat.
+test "cdp.input: key events carry key, code, keyCode, location and repeat" {
+    try expectRealKeys(struct {
+        fn run(ctx: *testing.TestContext, local: *const lp.js.Local) !void {
+            try ctx.processMessage(.{ .id = 1, .method = "Input.dispatchKeyEvent", .params = .{ .type = "keyDown", .modifiers = 8, .key = "Shift", .code = "ShiftLeft", .windowsVirtualKeyCode = 16, .nativeVirtualKeyCode = 16 } });
+            try ctx.processMessage(.{ .id = 2, .method = "Input.dispatchKeyEvent", .params = .{ .type = "keyDown", .modifiers = 8, .text = "A", .key = "A", .code = "KeyA", .windowsVirtualKeyCode = 65, .nativeVirtualKeyCode = 65 } });
+            try ctx.processMessage(.{ .id = 3, .method = "Input.dispatchKeyEvent", .params = .{ .type = "keyDown", .modifiers = 8, .text = "A", .key = "A", .code = "KeyA", .windowsVirtualKeyCode = 65, .autoRepeat = true } });
+            try ctx.processMessage(.{ .id = 4, .method = "Input.dispatchKeyEvent", .params = .{ .type = "keyUp", .modifiers = 0, .key = "Shift", .code = "ShiftLeft", .windowsVirtualKeyCode = 16 } });
+            try ctx.processMessage(.{ .id = 5, .method = "Input.dispatchKeyEvent", .params = .{ .type = "keyUp", .modifiers = 0, .key = "a", .code = "KeyA", .windowsVirtualKeyCode = 65 } });
+            try ctx.processMessage(.{ .id = 6, .method = "Input.dispatchKeyEvent", .params = .{ .type = "keyDown", .text = "1", .key = "1", .code = "Numpad1", .windowsVirtualKeyCode = 97 } });
+            try ctx.processMessage(.{ .id = 7, .method = "Input.dispatchKeyEvent", .params = .{ .type = "keyUp", .key = "Control", .code = "ControlRight", .windowsVirtualKeyCode = 17, .location = 2 } });
+
+            try expectJsString(local, "inp.value", "AA1");
+            try expectJsString(local, "log.join('\\n')",
+                \\keydown:Shift:ShiftLeft:16:16:0:1:false:true:true
+                \\keydown:A:KeyA:65:65:0:0:false:true:true
+                \\keypress:A:KeyA:65:65:65:0:false:true:true
+                \\beforeinput:insertText:A:true
+                \\input:insertText:A:true
+                \\keydown:A:KeyA:65:65:0:0:true:true:true
+                \\keypress:A:KeyA:65:65:65:0:true:true:true
+                \\beforeinput:insertText:A:true
+                \\input:insertText:A:true
+                \\keyup:Shift:ShiftLeft:16:16:0:1:false:false:true
+                \\keyup:a:KeyA:65:65:0:0:false:false:true
+                \\keydown:1:Numpad1:97:97:0:3:false:false:true
+                \\keypress:1:Numpad1:49:49:49:3:false:false:true
+                \\beforeinput:insertText:1:true
+                \\input:insertText:1:true
+                \\keyup:Control:ControlRight:17:17:0:2:false:false:true
+            );
+        }
+    }.run);
 }
 
 // Puppeteer sends radius and force 0.5; Chrome passes them through unchanged.

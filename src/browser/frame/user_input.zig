@@ -62,6 +62,27 @@ const HoverContext = struct {
     y: f64 = 0,
     buttons: u16 = 0,
     modifiers: Modifiers = .{},
+    // The top-level point and the motion that brought the pointer here; they
+    // don't change across documents, unlike x and y.
+    screen_x: ?f64 = null,
+    screen_y: ?f64 = null,
+    movement_x: f64 = 0,
+    movement_y: f64 = 0,
+    pressure: f64 = 0.5,
+
+    fn fromGesture(g: Gesture) HoverContext {
+        return .{
+            .x = g.x,
+            .y = g.y,
+            .buttons = g.buttons_down,
+            .modifiers = g.modifiers,
+            .screen_x = g.screen_x,
+            .screen_y = g.screen_y,
+            .movement_x = g.movement_x,
+            .movement_y = g.movement_y,
+            .pressure = g.pressure,
+        };
+    }
 
     fn offset(self: HoverContext, dx: f64, dy: f64) HoverContext {
         var ctx = self;
@@ -69,10 +90,18 @@ const HoverContext = struct {
         ctx.y += dy;
         return ctx;
     }
+};
 
-    fn emit(ctx: HoverContext, frame: *Frame, target: *Element, comptime suffix: []const u8, related: ?*Element, bubbling: bool) void {
-        dispatchPointerBoundary(frame, target, "pointer" ++ suffix, related, bubbling, ctx);
-        dispatchMouseBoundary(frame, target, "mouse" ++ suffix, related, bubbling, ctx);
+/// The pointer half of a mouse hover transition.
+const PointerHover = struct {
+    ctx: HoverContext,
+
+    fn offset(self: PointerHover, dx: f64, dy: f64) PointerHover {
+        return .{ .ctx = self.ctx.offset(dx, dy) };
+    }
+
+    fn emit(self: PointerHover, frame: *Frame, target: *Element, comptime suffix: []const u8, related: ?*Element, bubbling: bool) void {
+        dispatchPointerBoundary(frame, target, "pointer" ++ suffix, related, bubbling, self.ctx);
     }
 };
 
@@ -94,6 +123,11 @@ const CompatHover = struct {
 // hovered item so that trasitions can fire the correct events. e.g. mouseout
 // bubbles up normally, but mouseleave will only fire on parents where the new
 // target isn't part of.
+//
+// A mouse transition (a HoverContext) fires every pointer boundary event
+// before the mouse ones, as Chrome does: pointerout, pointerleave,
+// pointerover, pointerenter, then mouseout, mouseleave, mouseover,
+// mouseenter.
 pub fn updateHoverTarget(frame: *Frame, to: ?*Element, emitter: anytype) void {
     const page = frame.page;
     const from = page.input_hover_target;
@@ -101,6 +135,15 @@ pub fn updateHoverTarget(frame: *Frame, to: ?*Element, emitter: anytype) void {
         return;
     }
     page.input_hover_target = to;
+    if (@TypeOf(emitter) == HoverContext) {
+        hoverTransition(frame, from, to, PointerHover{ .ctx = emitter });
+        hoverTransition(frame, from, to, CompatHover{ .ctx = emitter });
+        return;
+    }
+    hoverTransition(frame, from, to, emitter);
+}
+
+fn hoverTransition(frame: *Frame, from: ?*Element, to: ?*Element, emitter: anytype) void {
     const from_owner = if (from) |el| el.ownerFrame(frame) else null;
     const to_owner = if (to) |el| el.ownerFrame(frame) else null;
     if (from_owner == to_owner) {
@@ -231,12 +274,19 @@ fn dispatchPointerBoundary(frame: *Frame, target: *Element, comptime pointer_typ
         .composed = bubbling,
         .clientX = ctx.x,
         .clientY = ctx.y,
+        .screenX = ctx.screen_x orelse ctx.x,
+        .screenY = ctx.screen_y orelse ctx.y,
+        .movementX = ctx.movement_x,
+        .movementY = ctx.movement_y,
         // No button changed state: https://www.w3.org/TR/pointerevents3/#the-button-property
         .button = -1,
         .buttons = ctx.buttons,
         .pointerId = 1,
         .pointerType = "mouse",
         .isPrimary = true,
+        .width = 1,
+        .height = 1,
+        .pressure = if (ctx.buttons != 0) ctx.pressure else 0.0,
         .relatedTarget = related_target,
         .ctrlKey = modifiers.ctrl,
         .shiftKey = modifiers.shift,
@@ -263,6 +313,10 @@ fn dispatchMouseBoundary(frame: *Frame, target: *Element, comptime mouse_typ: []
         .composed = bubbling,
         .clientX = ctx.x,
         .clientY = ctx.y,
+        .screenX = ctx.screen_x orelse ctx.x,
+        .screenY = ctx.screen_y orelse ctx.y,
+        .movementX = integerMovement(ctx.screen_x orelse ctx.x, ctx.movement_x),
+        .movementY = integerMovement(ctx.screen_y orelse ctx.y, ctx.movement_y),
         .buttons = ctx.buttons,
         .relatedTarget = related_target,
         .ctrlKey = modifiers.ctrl,
@@ -290,7 +344,23 @@ const Gesture = struct {
     width: f64 = 1,
     height: f64 = 1,
     pressure: f64 = 0.5,
+    // The point in the top-level viewport, which is the screen: the window
+    // sits at its origin. Null for input without one; x and y stand in.
+    screen_x: ?f64 = null,
+    screen_y: ?f64 = null,
+    // The pointer's motion since the previous mouse message, in top-level
+    // coordinates. Only moves carry it.
+    movement_x: f64 = 0,
+    movement_y: f64 = 0,
 };
+
+/// MouseEvent coordinates are whole pixels (see MouseEvent.compatCoordinate),
+/// so its movement is the change in those: consecutive events' screenX differ
+/// by exactly their movementX, as in Chrome.
+fn integerMovement(screen: f64, movement: f64) f64 {
+    if (movement == 0) return 0;
+    return @floor(screen) - @floor(screen - movement);
+}
 
 /// Dispatch a trusted pointer event; returns whether its default action is off:
 /// preventDefault() cancelled it, or its frame is gone (a listener can remove
@@ -311,6 +381,10 @@ fn emitPointer(
         .composed = !boundary,
         .clientX = g.x,
         .clientY = g.y,
+        .screenX = g.screen_x orelse g.x,
+        .screenY = g.screen_y orelse g.y,
+        .movementX = g.movement_x,
+        .movementY = g.movement_y,
         .button = g.button,
         .buttons = g.buttons_down,
         .detail = detail,
@@ -346,6 +420,10 @@ fn emitMouse(
         .composed = true,
         .clientX = g.x,
         .clientY = g.y,
+        .screenX = g.screen_x orelse g.x,
+        .screenY = g.screen_y orelse g.y,
+        .movementX = integerMovement(g.screen_x orelse g.x, g.movement_x),
+        .movementY = integerMovement(g.screen_y orelse g.y, g.movement_y),
         .button = g.button,
         .buttons = g.buttons_down,
         .detail = detail,
@@ -469,7 +547,7 @@ fn commonClickTarget(frame: *Frame, down: *Element, up: *Element) ?*Element {
 }
 
 pub fn moveSequence(frame: *Frame, target: *Element, g: Gesture) !void {
-    updateHoverTarget(frame, target, HoverContext{ .x = g.x, .y = g.y, .buttons = g.buttons_down, .modifiers = g.modifiers });
+    updateHoverTarget(frame, target, HoverContext.fromGesture(g));
     // A move changes no button: https://www.w3.org/TR/pointerevents3/#the-button-property
     var pg = g;
     pg.button = -1;
@@ -619,7 +697,7 @@ fn inBox(x: f64, y: f64, width: f64, height: f64) bool {
     return x >= 0 and y >= 0 and x < width and y < height;
 }
 
-const Point = struct { x: f64, y: f64 };
+pub const Point = struct { x: f64, y: f64 };
 
 /// Where `frame`'s viewport sits in the top-level viewport. The faux layout
 /// has no transform scaling and client borders are zero; this uses the same
@@ -645,7 +723,49 @@ pub fn pointInFrame(from: *Frame, to: *Frame, x: f64, y: f64) Point {
     return .{ .x = x + from_origin.x - to_origin.x, .y = y + from_origin.y - to_origin.y };
 }
 
-pub fn triggerMousePress(frame: *Frame, x: f64, y: f64, button: i32, click_count: i32) !void {
+/// What a mouse message carries besides its point and button.
+pub const MouseInput = struct {
+    modifiers: Modifiers = .{},
+    /// CDP `force`, the pointer's pressure while a button is held. Without
+    /// one, a held button reports 0.5, as in Chrome.
+    force: ?f64 = null,
+};
+
+/// Records where the mouse now is, in the top-level viewport, and returns how
+/// far it moved since the previous mouse message: nothing for the first.
+fn trackMousePosition(frame: *Frame, x: f64, y: f64) Point {
+    const page = frame.page;
+    const previous = page.input_mouse_position;
+    page.input_mouse_position = .{ .x = x, .y = y };
+    const p = previous orelse return .{ .x = 0, .y = 0 };
+    return .{ .x = x - p.x, .y = y - p.y };
+}
+
+/// A gesture at the top-level point (`x`, `y`) that hit-tested to `hit`.
+fn mouseGesture(hit: MouseHit, x: f64, y: f64, input: MouseInput) Gesture {
+    const force = input.force orelse 0;
+    return .{
+        .x = hit.x,
+        .y = hit.y,
+        .screen_x = x,
+        .screen_y = y,
+        .modifiers = input.modifiers,
+        .pressure = if (force > 0) force else 0.5,
+    };
+}
+
+/// A press or release lands where the pointer is, so when no move brought it
+/// over `target`, the boundary events fire first, without a pointermove or
+/// mousemove, as in Chrome. `g` is the press or release's gesture, before
+/// its button changes state.
+fn hoverForButton(frame: *Frame, target: *Element, g: Gesture) void {
+    var hover = g;
+    hover.buttons_down = frame.page.input_pointer.held;
+    updateHoverTarget(frame, target, HoverContext.fromGesture(hover));
+}
+
+pub fn triggerMousePress(frame: *Frame, x: f64, y: f64, button: i32, click_count: i32, input: MouseInput) !void {
+    _ = trackMousePosition(frame, x, y);
     const hit = try mouseHitTest(frame, x, y);
     const target = hit.target orelse {
         // Don't leave a prior gesture's state for the next message to misread.
@@ -663,21 +783,25 @@ pub fn triggerMousePress(frame: *Frame, x: f64, y: f64, button: i32, click_count
         });
     }
 
-    try frame.page.input_pointer.press(hit.frame, target, .{
-        .button = button,
-        // clickCount 0 (omitted) stays 0, not forced to 1: Chrome and Firefox
-        // both fire mousedown with detail 0 in that case.
-        .click_count = if (click_count > 0) @intCast(click_count) else 0,
-        .x = hit.x,
-        .y = hit.y,
-    });
+    var g = mouseGesture(hit, x, y, input);
+    g.button = button;
+    // clickCount 0 (omitted) stays 0, not forced to 1: Chrome and Firefox
+    // both fire mousedown with detail 0 in that case.
+    g.click_count = if (click_count > 0) @intCast(click_count) else 0;
+    hoverForButton(hit.frame, target, g);
+    try frame.page.input_pointer.press(hit.frame, target, g);
 }
 
-pub fn triggerMouseMove(frame: *Frame, x: f64, y: f64) !void {
+pub fn triggerMouseMove(frame: *Frame, x: f64, y: f64, input: MouseInput) !void {
+    const movement = trackMousePosition(frame, x, y);
     const hit = try mouseHitTest(frame, x, y);
+    var g = mouseGesture(hit, x, y, input);
+    g.buttons_down = frame.page.input_pointer.held;
+    g.movement_x = movement.x;
+    g.movement_y = movement.y;
     const target = hit.target orelse {
         // A miss ends hover without releasing a held button.
-        updateHoverTarget(frame, null, HoverContext{ .x = x, .y = y, .buttons = frame.page.input_pointer.held });
+        updateHoverTarget(hit.frame, null, HoverContext.fromGesture(g));
         return;
     };
     if (comptime lp.IS_DEBUG) {
@@ -690,10 +814,11 @@ pub fn triggerMouseMove(frame: *Frame, x: f64, y: f64) !void {
         });
     }
 
-    try moveSequence(hit.frame, target, .{ .buttons_down = frame.page.input_pointer.held, .x = hit.x, .y = hit.y });
+    try moveSequence(hit.frame, target, g);
 }
 
-pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_count: i32) !void {
+pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_count: i32, input: MouseInput) !void {
+    _ = trackMousePosition(frame, x, y);
     const pointer = &frame.page.input_pointer;
     // A release that misses every element still lets go of the button, so
     // the next message doesn't read it as held.
@@ -716,12 +841,11 @@ pub fn triggerMouseRelease(frame: *Frame, x: f64, y: f64, button: i32, click_cou
         });
     }
 
-    _ = try pointer.release(hit.frame, target, .{
-        .button = button,
-        .click_count = if (click_count > 0) @intCast(click_count) else 0,
-        .x = hit.x,
-        .y = hit.y,
-    });
+    var g = mouseGesture(hit, x, y, input);
+    g.button = button;
+    g.click_count = if (click_count > 0) @intCast(click_count) else 0;
+    hoverForButton(hit.frame, target, g);
+    _ = try pointer.release(hit.frame, target, g);
 }
 
 pub fn triggerMouseWheel(frame: *Frame, x: f64, y: f64, delta_x: f64, delta_y: f64) !void {
@@ -1722,6 +1846,7 @@ fn keypressFor(frame: *Frame, keydown: *const KeyboardEvent) !*KeyboardEvent {
         .key = keydown.getKey().asString(),
         .code = keydown._code,
         .location = keydown._location,
+        .repeat = keydown._repeat,
         .ctrlKey = keydown.getCtrlKey(),
         .shiftKey = keydown.getShiftKey(),
         .altKey = keydown.getAltKey(),
@@ -2311,9 +2436,9 @@ test "user_input: mouse hit testing descends nested iframe viewports" {
         \\  target.addEventListener(type, e => events.push({type, x:e.clientX, y:e.clientY, trusted:e.isTrusted}));
         \\}
     , null);
-    try triggerMouseMove(main, x, y);
-    try triggerMousePress(main, x, y, mouse_button.main, 1);
-    try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+    try triggerMouseMove(main, x, y, .{});
+    try triggerMousePress(main, x, y, mouse_button.main, 1, .{});
+    try triggerMouseRelease(main, x, y, mouse_button.main, 1, .{});
     try testing.expect(focusedFrame(main) == nested);
     try insertText(focusedFrame(main), "typed");
     try testing.expect((try ls.local.compileAndRun(
@@ -2339,9 +2464,9 @@ test "user_input: mouse release in another document does not click" {
     main.js.localScope(&ls);
     defer ls.deinit();
     _ = try ls.local.compileAndRun("window.clicks = 0; document.addEventListener('click', () => clicks++);", null);
-    try triggerMousePress(main, inner_rect.x + nested_rect.x + child_rect.x + 1, inner_rect.y + nested_rect.y + child_rect.y + 1, mouse_button.main, 1);
+    try triggerMousePress(main, inner_rect.x + nested_rect.x + child_rect.x + 1, inner_rect.y + nested_rect.y + child_rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect(main.page.input_pointer.down_target == inner);
-    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1);
+    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect((try ls.local.compileAndRun("clicks === 0", null)).isTrue());
     try testing.expectEqual(0, main.page.input_pointer.held);
     try testing.expect(main.page.input_pointer.down_target == null);
@@ -2366,19 +2491,19 @@ test "user_input: a blank viewport point hovers the root; only leaving the viewp
         \\  document.documentElement.addEventListener(type, e => events.push(`${type}:${e.target.tagName}`));
         \\}
     , null);
-    try triggerMouseMove(main, rect.x + 1, rect.y + 1);
+    try triggerMouseMove(main, rect.x + 1, rect.y + 1, .{});
     _ = try ls.local.compileAndRun("events = []", null);
 
-    try triggerMouseMove(main, 1, blank_y);
+    try triggerMouseMove(main, 1, blank_y, .{});
     try testing.expect(main.page.input_hover_target == main.document.getDocumentElement().?);
-    try triggerMousePress(main, 1, blank_y, mouse_button.main, 1);
-    try triggerMouseRelease(main, 1, blank_y, mouse_button.main, 1);
+    try triggerMousePress(main, 1, blank_y, mouse_button.main, 1, .{});
+    try triggerMouseRelease(main, 1, blank_y, mouse_button.main, 1, .{});
     try testing.expect((try ls.local.compileAndRun(
         \\events.join(',') === 'mouseout:INPUT,mouseover:HTML,mousedown:HTML,click:HTML'
     , null)).isTrue());
 
     _ = try ls.local.compileAndRun("events = []", null);
-    try triggerMouseMove(main, 1, blank_y + 10);
+    try triggerMouseMove(main, 1, blank_y + 10, .{});
     try testing.expect(main.page.input_hover_target == null);
     try testing.expect((try ls.local.compileAndRun("events.join(',') === 'mouseout:HTML,mouseleave:HTML'", null)).isTrue());
 }
@@ -2401,7 +2526,7 @@ test "user_input: removing hit iframe in pointerdown stops its mouse sequence" {
         \\for (const type of ['mousedown', 'focus', 'mouseup', 'click']) childInput.addEventListener(type, () => events.push(type));
     , null);
     try testing.expect((try main.document.hitTest(rect.x + iframe_rect.x + 1, rect.y + iframe_rect.y + 1, main)) == child.iframe.?.asElement());
-    try triggerMousePress(main, rect.x + iframe_rect.x + 1, rect.y + iframe_rect.y + 1, mouse_button.main, 1);
+    try triggerMousePress(main, rect.x + iframe_rect.x + 1, rect.y + iframe_rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect((try ls.local.compileAndRun("events.join(',') === 'pointerdown'", null)).isTrue());
     try testing.expect(child.window._closed);
     try testing.expect(main.page.input_pointer.down_target == null);
@@ -2446,9 +2571,9 @@ test "user_input: an excluded child document root is not a mouse target" {
         try testing.expect((try main.document.hitTest(x, y, main)) == iframe);
         try testing.expect((try child.document.hitTest(1, 1, child)) == null);
 
-        try triggerMouseMove(main, x, y);
-        try triggerMousePress(main, x, y, mouse_button.main, 1);
-        try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+        try triggerMouseMove(main, x, y, .{});
+        try triggerMousePress(main, x, y, mouse_button.main, 1, .{});
+        try triggerMouseRelease(main, x, y, mouse_button.main, 1, .{});
         try triggerMouseWheel(main, x, y, 0, 10);
         try testing.expect((try child_ls.local.compileAndRun("events.length === 0", null)).isTrue());
         try testing.expect((try main_ls.local.compileAndRun("parentEvents.length === 0", null)).isTrue());
@@ -2487,9 +2612,9 @@ test "user_input: mouse hit testing still enters a blank child document" {
         \\}
     , null);
 
-    try triggerMouseMove(main, x, y);
-    try triggerMousePress(main, x, y, mouse_button.main, 1);
-    try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+    try triggerMouseMove(main, x, y, .{});
+    try triggerMousePress(main, x, y, mouse_button.main, 1, .{});
+    try triggerMouseRelease(main, x, y, mouse_button.main, 1, .{});
     try testing.expect((try ls.local.compileAndRun(
         \\events.map(e => e.type).join(',') === 'pointerover,mouseover,pointermove,mousemove,pointerdown,mousedown,pointerup,mouseup,click' &&
         \\events.every(e => e.target === 'HTML' && e.x === 1 && e.y === 1)
@@ -2519,25 +2644,25 @@ test "user_input: excluded child roots clear hover without releasing held button
                 \\  target.addEventListener(type, e => events.push({type, buttons:e.buttons, related:e.relatedTarget, trusted:e.isTrusted}));
                 \\}
             , null);
-            try triggerMouseMove(main, x, y);
-            try triggerMousePress(main, x, y, mouse_button.main, 1);
+            try triggerMouseMove(main, x, y, .{});
+            try triggerMousePress(main, x, y, mouse_button.main, 1, .{});
             try testing.expect(main.page.input_hover_target == target);
             const root = child.document.getDocumentElement().?;
             try root.setStyle(style, child);
             try testing.expect((try child.document.hitTest(1, 1, child)) == null);
-            try triggerMouseMove(main, iframe_rect.x + 1, iframe_rect.y + 1);
+            try triggerMouseMove(main, iframe_rect.x + 1, iframe_rect.y + 1, .{});
             try testing.expect(main.page.input_hover_target == null);
             try testing.expectEqual(1, main.page.input_pointer.held);
             try testing.expect(main.page.input_pointer.down_target == target);
             try root.setStyle("", child);
-            try triggerMouseMove(main, x, y);
+            try triggerMouseMove(main, x, y, .{});
             try testing.expect(main.page.input_hover_target == target);
             try testing.expect((try ls.local.compileAndRun(
-                \\events.map(e => e.type).join(',') === 'pointerover,mouseover,pointerenter,mouseenter,pointerout,mouseout,pointerleave,mouseleave,pointerover,mouseover,pointerenter,mouseenter' &&
+                \\events.map(e => e.type).join(',') === 'pointerover,pointerenter,mouseover,mouseenter,pointerout,pointerleave,mouseout,mouseleave,pointerover,pointerenter,mouseover,mouseenter' &&
                 \\events.every(e => e.related === null && e.trusted) &&
                 \\events.slice(0,4).every(e => e.buttons === 0) && events.slice(4).every(e => e.buttons === 1)
             , null)).isTrue());
-            try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+            try triggerMouseRelease(main, x, y, mouse_button.main, 1, .{});
             try testing.expectEqual(0, main.page.input_pointer.held);
             try testing.expect(main.page.input_pointer.down_target == null);
         }
@@ -2575,7 +2700,7 @@ test "user_input: removing a pressed iframe between messages clears pointer stat
         , null);
     }
 
-    try triggerMousePress(main, target_rect.x + iframe_rect.x + 1, target_rect.y + iframe_rect.y + 1, mouse_button.main, 1);
+    try triggerMousePress(main, target_rect.x + iframe_rect.x + 1, target_rect.y + iframe_rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect(main.page.input_pointer.down_target == target);
     try testing.expectEqual(@as(u16, 1), main.page.input_pointer.held);
     try testing.expect(main.page.input_pointer.mousedown_suppressed);
@@ -2587,12 +2712,12 @@ test "user_input: removing a pressed iframe between messages clears pointer stat
     try testing.expectEqual(@as(u16, 0), main.page.input_pointer.held);
     try testing.expect(!main.page.input_pointer.mousedown_suppressed);
 
-    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1);
+    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect((try main_ls.local.compileAndRun("events.join(',') === 'mouseup'", null)).isTrue());
 
     // A stale suppression flag would drop this new gesture's mousedown.
-    try triggerMousePress(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1);
-    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1);
+    try triggerMousePress(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1, .{});
+    try triggerMouseRelease(main, outer_rect.x + 1, outer_rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect((try main_ls.local.compileAndRun("events.join(',') === 'mouseup,mousedown,mouseup,click'", null)).isTrue());
     try testing.expect(main.page.input_pointer.down_target == null);
     try testing.expectEqual(@as(u16, 0), main.page.input_pointer.held);
@@ -2713,14 +2838,13 @@ test "user_input: mouse hover transitions cross nested iframe documents" {
     , null);
 
     // Start on the top-level input, then enter the child input.
-    try triggerMouseMove(main, outer_rect.x + 1, outer_rect.y + 1);
+    try triggerMouseMove(main, outer_rect.x + 1, outer_rect.y + 1, .{});
     _ = try main_ls.local.compileAndRun("events = []", null);
-    try triggerMouseMove(main, child_rect.x + middle_rect.x + 1, child_rect.y + middle_rect.y + 1);
+    try triggerMouseMove(main, child_rect.x + middle_rect.x + 1, child_rect.y + middle_rect.y + 1, .{});
     try testing.expect((try main_ls.local.compileAndRun(
         \\events.map(e => `${e.where}:${e.type}`).join(',') ===
-        \\'outer:pointerout,outer:mouseout,outer:pointerleave,outer:mouseleave,' +
-        \\'child:pointerover,child:mouseover,child:pointerenter,child:mouseenter,' +
-        \\'middle:pointerover,middle:mouseover,middle:pointerenter,middle:mouseenter' &&
+        \\'outer:pointerout,outer:pointerleave,child:pointerover,child:pointerenter,middle:pointerover,middle:pointerenter,' +
+        \\'outer:mouseout,outer:mouseleave,child:mouseover,child:mouseenter,middle:mouseover,middle:mouseenter' &&
         \\events.find(e => e.where === 'outer' && e.type === 'pointerout').related === 'child' &&
         \\events.find(e => e.where === 'child' && e.type === 'pointerover').related === 'outer' &&
         \\events.find(e => e.where === 'middle' && e.type === 'pointerover').related === null &&
@@ -2734,12 +2858,11 @@ test "user_input: mouse hover transitions cross nested iframe documents" {
     _ = try main_ls.local.compileAndRun("events = []", null);
     const nested_x = child_rect.x + nested_rect.x + inner_rect.x + 1;
     const nested_y = child_rect.y + nested_rect.y + inner_rect.y + 1;
-    try triggerMouseMove(main, nested_x, nested_y);
+    try triggerMouseMove(main, nested_x, nested_y, .{});
     try testing.expect((try main_ls.local.compileAndRun(
         \\events.map(e => `${e.where}:${e.type}`).join(',') ===
-        \\'middle:pointerout,middle:mouseout,middle:pointerleave,middle:mouseleave,' +
-        \\'nested:pointerover,nested:mouseover,nested:pointerenter,nested:mouseenter,' +
-        \\'inner:pointerover,inner:mouseover,inner:pointerenter,inner:mouseenter' &&
+        \\'middle:pointerout,middle:pointerleave,nested:pointerover,nested:pointerenter,inner:pointerover,inner:pointerenter,' +
+        \\'middle:mouseout,middle:mouseleave,nested:mouseover,nested:mouseenter,inner:mouseover,inner:mouseenter' &&
         \\events.find(e => e.where === 'middle' && e.type === 'pointerout').related === 'nested' &&
         \\events.find(e => e.where === 'nested' && e.type === 'pointerover').related === 'middle' &&
         \\events.find(e => e.where === 'inner' && e.type === 'pointerover').related === null &&
@@ -2751,12 +2874,11 @@ test "user_input: mouse hover transitions cross nested iframe documents" {
 
     // Leaving the nested frame keeps relatedTarget local to the child document.
     _ = try main_ls.local.compileAndRun("events = []", null);
-    try triggerMouseMove(main, child_rect.x + middle_rect.x + 1, child_rect.y + middle_rect.y + 1);
+    try triggerMouseMove(main, child_rect.x + middle_rect.x + 1, child_rect.y + middle_rect.y + 1, .{});
     try testing.expect((try main_ls.local.compileAndRun(
         \\events.map(e => `${e.where}:${e.type}`).join(',') ===
-        \\'inner:pointerout,inner:mouseout,inner:pointerleave,inner:mouseleave,' +
-        \\'nested:pointerout,nested:mouseout,nested:pointerleave,nested:mouseleave,' +
-        \\'middle:pointerover,middle:mouseover,middle:pointerenter,middle:mouseenter' &&
+        \\'inner:pointerout,inner:pointerleave,nested:pointerout,nested:pointerleave,middle:pointerover,middle:pointerenter,' +
+        \\'inner:mouseout,inner:mouseleave,nested:mouseout,nested:mouseleave,middle:mouseover,middle:mouseenter' &&
         \\events.find(e => e.where === 'inner' && e.type === 'pointerout').related === null &&
         \\events.find(e => e.where === 'nested' && e.type === 'pointerout').related === 'middle' &&
         \\events.find(e => e.where === 'middle' && e.type === 'pointerover').related === 'nested' &&
@@ -2765,12 +2887,11 @@ test "user_input: mouse hover transitions cross nested iframe documents" {
 
     // Leave the child frame for the top-level input.
     _ = try main_ls.local.compileAndRun("events = []", null);
-    try triggerMouseMove(main, outer_rect.x + 1, outer_rect.y + 1);
+    try triggerMouseMove(main, outer_rect.x + 1, outer_rect.y + 1, .{});
     try testing.expect((try main_ls.local.compileAndRun(
         \\events.map(e => `${e.where}:${e.type}`).join(',') ===
-        \\'middle:pointerout,middle:mouseout,middle:pointerleave,middle:mouseleave,' +
-        \\'child:pointerout,child:mouseout,child:pointerleave,child:mouseleave,' +
-        \\'outer:pointerover,outer:mouseover,outer:pointerenter,outer:mouseenter' &&
+        \\'middle:pointerout,middle:pointerleave,child:pointerout,child:pointerleave,outer:pointerover,outer:pointerenter,' +
+        \\'middle:mouseout,middle:mouseleave,child:mouseout,child:mouseleave,outer:mouseover,outer:mouseenter' &&
         \\events.find(e => e.where === 'middle' && e.type === 'pointerout').related === null &&
         \\events.find(e => e.where === 'child' && e.type === 'pointerout').related === 'outer' &&
         \\events.find(e => e.where === 'outer' && e.type === 'pointerover').related === 'child' &&
@@ -2791,8 +2912,8 @@ test "user_input: mouse blank iframe takes document focus" {
     _ = try ls.local.compileAndRun("document.body.replaceChildren();", null);
     try outer.focus(main);
     const rect = child.iframe.?.asElement().boundingClientRectValues(main);
-    try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-    try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
+    try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect(main.document._active_element == child.iframe.?.asElement());
     try testing.expect(focusedFrame(main) == child);
     try insertText(focusedFrame(main), "wrong-document");
@@ -2817,8 +2938,8 @@ test "user_input: mouse static nested iframe takes document focus" {
     const nested_rect = nested.iframe.?.asElement().boundingClientRectValues(child);
     const x = child_rect.x + nested_rect.x + 10;
     const y = child_rect.y + nested_rect.y + 10;
-    try triggerMousePress(main, x, y, mouse_button.main, 1);
-    try triggerMouseRelease(main, x, y, mouse_button.main, 1);
+    try triggerMousePress(main, x, y, mouse_button.main, 1, .{});
+    try triggerMouseRelease(main, x, y, mouse_button.main, 1, .{});
     try testing.expect(main.document._active_element == child.iframe.?.asElement());
     try testing.expect(child.document._active_element == nested.iframe.?.asElement());
     try testing.expect(focusedFrame(main) == nested);
@@ -2840,8 +2961,8 @@ test "user_input: mouse blank iframe cancelled press preserves focus" {
         _ = try ls.local.compileAndRun(script, null);
         try outer.focus(main);
         const rect = child.iframe.?.asElement().boundingClientRectValues(main);
-        try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-        try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
+        try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
         try testing.expect(main.document._active_element == outer);
         try testing.expect(focusedFrame(main) == main);
     }
@@ -2866,7 +2987,7 @@ test "user_input: mouse removed blank iframe does not take focus" {
         _ = try ls.local.compileAndRun(script, null);
         try outer.focus(main);
         const rect = child.iframe.?.asElement().boundingClientRectValues(main);
-        try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
         try testing.expect(child.window._closed);
         try testing.expect(main.document._active_element == outer);
         try testing.expect(focusedFrame(main) == main);
@@ -2893,8 +3014,8 @@ test "user_input: mouse blank sibling iframe clears old focus chain" {
     , null);
     try middle.focus(child);
     const rect = sibling.iframe.?.asElement().boundingClientRectValues(main);
-    try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-    try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try triggerMousePress(main, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
+    try triggerMouseRelease(main, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect(main.document._active_element == sibling.iframe.?.asElement());
     try testing.expect(child.document._active_element == null);
     try testing.expect(focusedFrame(main) == sibling);
@@ -2934,9 +3055,9 @@ test "user_input: shadow mouse rects are viewport relative and native clicks rea
     const x = rect.x + 1;
     const y = rect.y + 1;
     try testing.expect((try mouseHitTest(frame, x, y)).target == inner);
-    try triggerMouseMove(frame, x, y);
-    try triggerMousePress(frame, x, y, mouse_button.main, 1);
-    try triggerMouseRelease(frame, x, y, mouse_button.main, 1);
+    try triggerMouseMove(frame, x, y, .{});
+    try triggerMousePress(frame, x, y, mouse_button.main, 1, .{});
+    try triggerMouseRelease(frame, x, y, mouse_button.main, 1, .{});
     try testing.expect((try ls.local.compileAndRun(
         \\events.length === 2 && events[0].listener === 'inner' && events[0].target === 'inner' &&
         \\events[1].listener === 'host' && events[1].target === 'host' && events[1].inner && events.every(e => e.trusted)
@@ -2994,8 +3115,8 @@ test "user_input: shadow mouse nested closed roots and window scroll share coord
     try testing.expectEqual(before.x - 30, rect.x);
     try testing.expectEqual(before.y - 10, rect.y);
     try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == target);
-    try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-    try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+    try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
+    try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
     try testing.expect((try ls.local.compileAndRun("deepClicks === 1 && nested.shadowRoot === null", null)).isTrue());
     _ = try ls.local.compileAndRun("nested.style.display = 'none'", null);
     try testing.expect((try mouseHitTest(frame, rect.x + 1, rect.y + 1)).target == host);
@@ -3043,24 +3164,24 @@ test "user_input: shadow mouse keeps host boundary path and common click target"
         const host = frame.document.getElementById("boundaryHost").?;
         const rect = inner.boundingClientRectValues(frame);
         const host_rect = host.boundingClientRectValues(frame);
-        try triggerMouseMove(frame, rect.x + 1, rect.y + 1);
+        try triggerMouseMove(frame, rect.x + 1, rect.y + 1, .{});
         try testing.expect((try ls.local.compileAndRun("enters.join(',') === 'pointer,mouse' && leaves.length === 0", null)).isTrue());
         // Moving within the host does not leave or re-enter it.
-        try triggerMouseMove(frame, host_rect.x + 1, host_rect.y + 1);
-        try triggerMouseMove(frame, rect.x + 1, rect.y + 1);
+        try triggerMouseMove(frame, host_rect.x + 1, host_rect.y + 1, .{});
+        try triggerMouseMove(frame, rect.x + 1, rect.y + 1, .{});
         try testing.expect((try ls.local.compileAndRun("enters.length === 2 && leaves.length === 0", null)).isTrue());
-        try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
-        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try triggerMousePress(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
+        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
         try testing.expect((try ls.local.compileAndRun(
             \\clicks.length === 2 && clicks[0].where === 'inner' && clicks[0].target === 'boundaryInner' &&
             \\clicks[1].where === 'host' && clicks[1].target === 'boundaryHost' &&
             \\clicks[1].inner === (boundaryMode === 'open') && clicks.every(e => e.trusted)
         , null)).isTrue());
         _ = try ls.local.compileAndRun("clicks = []", null);
-        try triggerMousePress(frame, host_rect.x + 1, host_rect.y + 1, mouse_button.main, 1);
-        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1);
+        try triggerMousePress(frame, host_rect.x + 1, host_rect.y + 1, mouse_button.main, 1, .{});
+        try triggerMouseRelease(frame, rect.x + 1, rect.y + 1, mouse_button.main, 1, .{});
         try testing.expect((try ls.local.compileAndRun("clicks.length === 1 && clicks[0].where === 'host' && clicks[0].trusted", null)).isTrue());
-        try triggerMouseMove(frame, -1, -1);
+        try triggerMouseMove(frame, -1, -1, .{});
         try testing.expect((try ls.local.compileAndRun("leaves.join(',') === 'pointer,mouse'", null)).isTrue());
     }
 }
@@ -3104,7 +3225,7 @@ test "user_input: shadow mouse press and release on shadow siblings clicks the h
     const end = other.boundingClientRectValues(frame);
     try testing.expect((try mouseHitTest(frame, start.x + 1, start.y + 1)).target == inner);
     try testing.expect((try mouseHitTest(frame, end.x + end.width - 1, end.y + 1)).target == other);
-    try triggerMousePress(frame, start.x + 1, start.y + 1, mouse_button.main, 1);
-    try triggerMouseRelease(frame, end.x + end.width - 1, end.y + 1, mouse_button.main, 1);
+    try triggerMousePress(frame, start.x + 1, start.y + 1, mouse_button.main, 1, .{});
+    try triggerMouseRelease(frame, end.x + end.width - 1, end.y + 1, mouse_button.main, 1, .{});
     try testing.expect((try ls.local.compileAndRun("events.length === 1 && events[0].listener === 'host' && events[0].trusted", null)).isTrue());
 }

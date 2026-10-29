@@ -23,6 +23,8 @@ const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 
 const Event = @import("../Event.zig");
+const Node = @import("../Node.zig");
+const Element = @import("../Element.zig");
 const EventTarget = @import("../EventTarget.zig");
 
 const UIEvent = @import("UIEvent.zig");
@@ -52,6 +54,9 @@ _client_x: f64,
 _client_y: f64,
 _ctrl_key: bool,
 _meta_key: bool,
+// https://w3c.github.io/pointerlock/#extensions-to-the-mouseevent-interface
+_movement_x: f64 = 0,
+_movement_y: f64 = 0,
 // https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/relatedTarget
 _related_target: ?*EventTarget = null,
 _screen_x: f64,
@@ -66,6 +71,8 @@ const MouseEventOptions = struct {
     clientY: f64 = 0.0,
     ctrlKey: bool = false,
     metaKey: bool = false,
+    movementX: f64 = 0.0,
+    movementY: f64 = 0.0,
     relatedTarget: ?*EventTarget = null,
     screenX: f64 = 0.0,
     screenY: f64 = 0.0,
@@ -107,6 +114,8 @@ fn initWithTrusted(arena: *lp.Arena, typ: String, _opts: ?Options, trusted: bool
             ._shift_key = opts.shiftKey,
             ._alt_key = opts.altKey,
             ._meta_key = opts.metaKey,
+            ._movement_x = opts.movementX,
+            ._movement_y = opts.movementY,
             ._button = @truncate(opts.button),
             ._buttons = opts.buttons,
             ._related_target = opts.relatedTarget,
@@ -181,14 +190,56 @@ pub fn getMetaKey(self: *const MouseEvent) bool {
     return self._meta_key;
 }
 
-fn getPageX(self: *const MouseEvent) f64 {
-    // this should be clientX + window.scrollX
-    return self.compatCoordinate(self._client_x);
+fn getMovementX(self: *const MouseEvent) f64 {
+    return self._movement_x;
 }
 
-fn getPageY(self: *const MouseEvent) f64 {
-    // this should be clientY + window.scrollY
-    return self.compatCoordinate(self._client_y);
+fn getMovementY(self: *const MouseEvent) f64 {
+    return self._movement_y;
+}
+
+/// The client point in the document: scrolled by the view's scroll offset.
+/// A synthetic event without a view has no document to scroll.
+fn pagePoint(self: *const MouseEvent, frame: *Frame) struct { x: f64, y: f64 } {
+    const ui = self._proto;
+    const view = ui._view orelse if (ui._proto._is_trusted) frame.window else null;
+    const window = view orelse return .{ .x = self._client_x, .y = self._client_y };
+    return .{
+        .x = self._client_x + @as(f64, @floatFromInt(window.getScrollX())),
+        .y = self._client_y + @as(f64, @floatFromInt(window.getScrollY())),
+    };
+}
+
+fn getPageX(self: *const MouseEvent, frame: *Frame) f64 {
+    return self.compatCoordinate(self.pagePoint(frame).x);
+}
+
+fn getPageY(self: *const MouseEvent, frame: *Frame) f64 {
+    return self.compatCoordinate(self.pagePoint(frame).y);
+}
+
+/// The point relative to the target's padding edge, computed on read, as in
+/// Blink. Before dispatch, or for a non-element target, it's the page point.
+/// https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
+fn offsetPoint(self: *const MouseEvent, frame: *Frame) struct { x: f64, y: f64 } {
+    const page = self.pagePoint(frame);
+    const target = self._proto._proto._target orelse return .{ .x = page.x, .y = page.y };
+    const node = target.is(Node) orelse return .{ .x = page.x, .y = page.y };
+    const element = node.is(Element) orelse return .{ .x = page.x, .y = page.y };
+    const owner = element.ownerFrame(frame) orelse frame;
+    const rect = element.boundingClientRectValues(owner);
+    return .{
+        .x = self._client_x - rect.x - element.getClientLeft(),
+        .y = self._client_y - rect.y - element.getClientTop(),
+    };
+}
+
+fn getOffsetX(self: *const MouseEvent, frame: *Frame) f64 {
+    return self.compatCoordinate(self.offsetPoint(frame).x);
+}
+
+fn getOffsetY(self: *const MouseEvent, frame: *Frame) f64 {
+    return self.compatCoordinate(self.offsetPoint(frame).y);
 }
 
 fn getRelatedTarget(self: *const MouseEvent) ?*EventTarget {
@@ -283,8 +334,10 @@ pub const JsApi = struct {
     pub const clientY = bridge.accessor(getClientY, null, .{});
     pub const ctrlKey = bridge.accessor(getCtrlKey, null, .{});
     pub const metaKey = bridge.accessor(getMetaKey, null, .{});
-    pub const offsetX = bridge.property(0.0, .{ .template = false });
-    pub const offsetY = bridge.property(0.0, .{ .template = false });
+    pub const movementX = bridge.accessor(getMovementX, null, .{});
+    pub const movementY = bridge.accessor(getMovementY, null, .{});
+    pub const offsetX = bridge.accessor(getOffsetX, null, .{});
+    pub const offsetY = bridge.accessor(getOffsetY, null, .{});
     pub const pageX = bridge.accessor(getPageX, null, .{});
     pub const pageY = bridge.accessor(getPageY, null, .{});
     pub const relatedTarget = bridge.accessor(getRelatedTarget, null, .{});

@@ -115,6 +115,8 @@ fn initWithTrusted(typ: []const u8, _opts: ?Options, trusted: bool, frame: *Fram
             ._shift_key = opts.shiftKey,
             ._alt_key = opts.altKey,
             ._meta_key = opts.metaKey,
+            ._movement_x = opts.movementX,
+            ._movement_y = opts.movementY,
             ._button = @truncate(opts.button),
             ._buttons = opts.buttons,
             ._related_target = opts.relatedTarget,
