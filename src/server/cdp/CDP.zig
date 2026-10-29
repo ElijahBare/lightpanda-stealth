@@ -317,6 +317,7 @@ fn dispatchCommand(command: *Command, method: []const u8) !void {
             asUint(u56, "Network") => return network_domain.processMessage(command),
             asUint(u56, "Storage") => return @import("domains/storage.zig").processMessage(command),
             asUint(u56, "Console") => return @import("domains/console.zig").processMessage(command),
+            asUint(u56, "Overlay") => return @import("domains/overlay.zig").processMessage(command),
             else => {},
         },
         8 => switch (@as(u64, @bitCast(domain[0..8].*))) {
