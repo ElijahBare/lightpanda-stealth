@@ -66,6 +66,13 @@ fn _loadFromFile(session: *Session, path: []const u8) !void {
         return;
     };
 
+    const loaded = try addJsonCookies(jar, json_cookies);
+    log.info(.app, "Cookie.loadFromFile", .{ .path = path, .count = loaded });
+}
+
+/// Adds parsed cookies to the jar. One the jar rejects (already expired,
+/// oversized, ...) is logged and skipped. Returns the number added.
+pub fn addJsonCookies(jar: *Cookie.Jar, json_cookies: []const JsonCookie) !usize {
     const now = lp.datetime.timestamp(.real);
 
     var loaded: usize = 0;
@@ -77,8 +84,7 @@ fn _loadFromFile(session: *Session, path: []const u8) !void {
         };
         loaded += 1;
     }
-
-    log.info(.app, "Cookie.loadFromFile", .{ .path = path, .count = loaded });
+    return loaded;
 }
 
 /// Save all cookies from the jar to a JSON file.
@@ -98,21 +104,32 @@ fn _saveToFile(jar: *Cookie.Jar, path: []const u8) !void {
 
     var buf: [8192]u8 = undefined;
     var writer = af.file.writer(lp.io, &buf);
-    try writeJson(jar, &writer.interface);
+    try writeJson(jar, &writer.interface, .{});
     try writer.end();
     try af.replace(lp.io);
 
     log.info(.app, "Cookie.saveToFile", .{ .path = path, .count = jar.len });
 }
 
-fn writeJson(jar: *const Cookie.Jar, w: *std.Io.Writer) !void {
+pub const WriteOpts = struct {
+    /// Leave out session cookies (no expiry), as Chrome does when it writes
+    /// its profile: they end with the browser session.
+    persistent_only: bool = false,
+};
+
+/// Writes the jar's cookies as a JSON array in the CDP Network.Cookie format.
+pub fn writeJson(jar: *const Cookie.Jar, w: *std.Io.Writer, opts: WriteOpts) !void {
     try w.writeByte('[');
     var it = jar.iterator();
     var i: usize = 0;
-    while (it.next()) |c| : (i += 1) {
+    while (it.next()) |c| {
+        if (opts.persistent_only and c.expires == null) {
+            continue;
+        }
         if (i > 0) {
             try w.writeByte(',');
         }
+        i += 1;
 
         try w.writeAll("\n  ");
         try std.json.Stringify.value(JsonCookie{
@@ -129,13 +146,13 @@ fn writeJson(jar: *const Cookie.Jar, w: *std.Io.Writer) !void {
         }, .{ .emit_null_optional_fields = false }, w);
     }
 
-    if (jar.len > 0) {
+    if (i > 0) {
         try w.writeByte('\n');
     }
     try w.writeAll("]\n");
 }
 
-const JsonCookie = struct {
+pub const JsonCookie = struct {
     name: []const u8,
     value: []const u8,
     domain: []const u8,

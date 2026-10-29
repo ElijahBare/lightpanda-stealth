@@ -31,6 +31,7 @@ pub const Regex = @import("Regex.zig");
 pub const Config = @import("Config.zig");
 pub const completion = @import("completion.zig");
 pub const cookies = @import("cookies.zig");
+pub const profile = @import("profile.zig");
 pub const datetime = @import("datetime.zig");
 pub const core_dump = @import("core_dump.zig");
 pub const malloc_tuning = @import("malloc_tuning.zig");
@@ -248,6 +249,9 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
     // Session.deinit unregisters from notification; close before notification.deinit runs.
     defer browser.closeSession();
 
+    if (app.config.profileDir()) |profile_dir| {
+        profile.load(session, profile_dir);
+    }
     if (app.config.cookieFile()) |cookie_path| {
         cookies.loadFromFile(session, cookie_path);
     }
@@ -255,6 +259,9 @@ pub fn fetch(app: *App, browser: *Browser, urls: []const [:0]const u8, opts: Fet
     defer {
         if (app.config.cookieJarFile()) |cookie_jar_path| {
             cookies.saveToFile(&session.cookie_jar, cookie_jar_path);
+        }
+        if (app.config.profileDir()) |profile_dir| {
+            profile.save(session, profile_dir);
         }
     }
 

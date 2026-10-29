@@ -358,7 +358,12 @@ fn isValidSessionId(self: *const CDP, input_session_id: []const u8) bool {
     return self.resolveSessionId(input_session_id) != null;
 }
 
+/// Creates the default browser context, backed by --profile-dir if set.
 pub fn createBrowserContext(self: *CDP) ![]const u8 {
+    return self.createBrowserContextWith(.{});
+}
+
+pub fn createBrowserContextWith(self: *CDP, opts: BrowserContext.InitOpts) ![]const u8 {
     if (self.browser_context != null) {
         return error.AlreadyExists;
     }
@@ -367,7 +372,7 @@ pub fn createBrowserContext(self: *CDP) ![]const u8 {
     self.browser_context = @as(BrowserContext, undefined);
     const browser_context = &self.browser_context.?;
 
-    try BrowserContext.init(browser_context, id, self);
+    try BrowserContext.init(browser_context, id, self, opts);
     return id;
 }
 
@@ -533,6 +538,11 @@ pub const BrowserContext = struct {
     http_proxy_changed: bool = false,
     user_agent_changed: bool = false,
 
+    // The --profile-dir this context loaded from and saves back to on
+    // dispose. Null for an ephemeral (incognito-like) context, which is what
+    // Target.createBrowserContext makes, as in Chrome.
+    profile_dir: ?[]const u8 = null,
+
     // Extra headers to add to all requests.
     extra_headers: std.ArrayList(http.Header) = .empty,
 
@@ -570,7 +580,13 @@ pub const BrowserContext = struct {
     // WebMCP domain state. Populated when `WebMCP.enable` is received.
     webmcp_invocations: std.AutoHashMapUnmanaged(u32, *@import("domains/webmcp.zig").Invocation) = .empty,
 
-    fn init(self: *BrowserContext, id: []const u8, cdp: *CDP) !void {
+    pub const InitOpts = struct {
+        // An ephemeral context ignores --profile-dir: it starts empty and
+        // nothing it stores outlives it.
+        ephemeral: bool = false,
+    };
+
+    fn init(self: *BrowserContext, id: []const u8, cdp: *CDP, opts: InitOpts) !void {
         const allocator = cdp.allocator;
 
         // Create notification for this BrowserContext
@@ -578,6 +594,10 @@ pub const BrowserContext = struct {
         errdefer notification.deinit();
 
         const session = try cdp.browser.newSession(notification);
+        const profile_dir = if (opts.ephemeral) null else cdp.app.config.profileDir();
+        if (profile_dir) |dir| {
+            lp.profile.load(session, dir);
+        }
         if (cdp.app.config.cookieFile()) |cookie_path| {
             lp.cookies.loadFromFile(session, cookie_path);
         }
@@ -604,6 +624,7 @@ pub const BrowserContext = struct {
             .captured_requests = .empty,
             .captured_responses = .empty,
             .notification = notification,
+            .profile_dir = profile_dir,
         };
         self.node_search_list = Node.Search.List.init(allocator, &self.node_registry);
         errdefer self.deinit();
@@ -661,6 +682,9 @@ pub const BrowserContext = struct {
 
         if (self.cdp.app.config.cookieJarFile()) |cookie_jar_path| {
             lp.cookies.saveToFile(&self.session.cookie_jar, cookie_jar_path);
+        }
+        if (self.profile_dir) |profile_dir| {
+            lp.profile.save(self.session, profile_dir);
         }
 
         // If the session has a frame, we need to clear it first. The page
@@ -1571,7 +1595,11 @@ pub const Command = struct {
     }
 
     pub fn createBrowserContext(self: *Command) !*BrowserContext {
-        _ = try self.cdp.createBrowserContext();
+        return self.createBrowserContextWith(.{});
+    }
+
+    pub fn createBrowserContextWith(self: *Command, opts: BrowserContext.InitOpts) !*BrowserContext {
+        _ = try self.cdp.createBrowserContextWith(opts);
         self.browser_context = &(self.cdp.browser_context.?);
         return self.browser_context.?;
     }
@@ -1856,4 +1884,58 @@ test "cdp: --cookie-jar saves on dispose and --cookie loads it back" {
     try testing.expectEqual(1, jar.len);
     var it = jar.iterator();
     try testing.expectEqualSlices(u8, "abc", it.next().?.value);
+}
+
+test "cdp: --profile-dir persists the default context, not createBrowserContext ones" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Doesn't exist yet: the first context creates it.
+    const path = try testing.tmpPath(&tmp, "profile");
+
+    const opts = &testing.base.test_config.mode.serve;
+    defer opts.profile_dir = null;
+    opts.profile_dir = path;
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    {
+        // The implicit default context: what Target.createTarget makes.
+        const bc = try ctx.loadBrowserContext(.{});
+        try testing.expect(bc.profile_dir != null);
+        try testing.expectEqual(0, bc.session.cookie_jar.len);
+        try bc.session.cookie_jar.populateFromResponse("https://example.com/", "sid=abc; Path=/; Max-Age=3600");
+        try bc.session.cookie_jar.populateFromResponse("https://example.com/", "tmp=1; Path=/");
+        const bucket = try bc.session.storage_shed.getOrPut(bc.session.browser.app.allocator, "https://example.com");
+        try bucket.local.setItem("theme", "dark");
+        try bucket.session.setItem("tab", "1");
+        ctx.cdp().disposeBrowserContext();
+    }
+
+    {
+        // An explicit context neither sees the profile nor writes to it.
+        try ctx.processMessage(.{ .id = 1, .method = "Target.createBrowserContext" });
+        const bc = &ctx.cdp().browser_context.?;
+        try testing.expectEqual(null, bc.profile_dir);
+        try testing.expectEqual(0, bc.session.cookie_jar.len);
+        try testing.expectEqual(0, bc.session.storage_shed._origins.count());
+        try bc.session.cookie_jar.populateFromResponse("https://example.com/", "incognito=1; Path=/; Max-Age=3600");
+        const bucket = try bc.session.storage_shed.getOrPut(bc.session.browser.app.allocator, "https://example.com");
+        try bucket.local.setItem("theme", "light");
+        ctx.cdp().disposeBrowserContext();
+    }
+
+    // The next default context starts where the first one left off, minus
+    // its session cookie and sessionStorage.
+    const bc = try ctx.loadBrowserContext(.{});
+    const jar = &bc.session.cookie_jar;
+    try testing.expectEqual(1, jar.len);
+    var it = jar.iterator();
+    const cookie = it.next().?;
+    try testing.expectEqualSlices(u8, "sid", cookie.name);
+    try testing.expectEqualSlices(u8, "abc", cookie.value);
+
+    const bucket = bc.session.storage_shed._origins.get("https://example.com").?;
+    try testing.expectEqualSlices(u8, "dark", bucket.local.getItem("theme").?);
+    try testing.expectEqual(0, bucket.session.getLength());
 }
