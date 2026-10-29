@@ -56,6 +56,7 @@ pub const HttpClient = @import("network/HttpClient.zig");
 pub const pdf = @import("browser/pdf.zig");
 pub const URL = @import("browser/URL.zig");
 pub const dump = @import("browser/dump.zig");
+pub const mhtml = @import("browser/mhtml.zig");
 pub const Page = @import("browser/Page.zig");
 pub const Frame = @import("browser/Frame.zig");
 pub const forms = @import("browser/forms.zig");
