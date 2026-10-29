@@ -343,6 +343,7 @@ const HtmlRunnerOpts = struct {
         .iframe = true,
     },
     experimental_features: Config.ExperimentalFeatures = .{},
+    force_open_shadow_roots: bool = false,
 };
 
 // Create a fresh page on `test_session` and return its root frame — for tests
@@ -377,6 +378,9 @@ pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
 
     test_session.experimental_features = opts.experimental_features;
     defer test_session.experimental_features = .{};
+
+    test_session.force_open_shadow_roots = opts.force_open_shadow_roots;
+    defer test_session.force_open_shadow_roots = false;
 
     const root = try std.fs.path.joinZ(arena_allocator, &.{ WEB_API_TEST_ROOT, path });
     const stat = std.Io.Dir.cwd().statFile(io, root, .{}) catch |err| {

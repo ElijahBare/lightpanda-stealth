@@ -28,11 +28,16 @@ const Allocator = std.mem.Allocator;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
+        enable,
+        disable,
         read,
         close,
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
+        // Not in Chrome's protocol, but clients that enable every domain
+        // they use send them; nothing is gated on them here.
+        .enable, .disable => return cmd.sendResult(null, .{}),
         .read => return read(cmd),
         .close => return close(cmd),
     }

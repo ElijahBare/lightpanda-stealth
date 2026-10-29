@@ -34,6 +34,8 @@ const structured_data = lp.structured_data;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
+        enable,
+        disable,
         dump,
         getMarkdown,
         getSemanticTree,
@@ -54,6 +56,9 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
+        // Clients that enable every domain they listen on send them;
+        // nothing is gated on them here.
+        .enable, .disable => return cmd.sendResult(null, .{}),
         .dump => return dump(cmd),
         .getMarkdown => return getMarkdown(cmd),
         .getSemanticTree => return getSemanticTree(cmd),

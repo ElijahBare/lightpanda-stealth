@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<meta name=lp-mode content=test>
+<script src="testing.js"></script>
+
+<div id="host1"></div>
+<div id="host2">
+  <template shadowrootmode="closed"><span id="declared">declared</span></template>
+</div>
+
+<script id="imperative_closed_is_open">
+{
+    const host = $('#host1');
+    const shadow = host.attachShadow({ mode: 'closed' });
+
+    testing.expectEqual('open', shadow.mode);
+    testing.expectEqual(shadow, host.shadowRoot);
+}
+</script>
+
+<script id="declarative_closed_is_open">
+{
+    const shadow = $('#host2').shadowRoot;
+    testing.expectEqual('open', shadow.mode);
+    testing.expectEqual('declared', shadow.getElementById('declared').textContent);
+}
+</script>
+
+<script id="attachShadow_stays_native">
+{
+    testing.expectEqual(true, Element.prototype.attachShadow.toString().includes('[native code]'));
+    testing.expectEqual(false, Object.prototype.hasOwnProperty.call(Element.prototype, '_attachShadow'));
+}
+</script>

@@ -30,12 +30,17 @@ pub const PreparedUri = Cookie.PreparedUri;
 
 pub fn processMessage(cmd: *CDP.Command) !void {
     const action = std.meta.stringToEnum(enum {
+        enable,
+        disable,
         clearCookies,
         setCookies,
         getCookies,
     }, cmd.input.action) orelse return error.UnknownMethod;
 
     switch (action) {
+        // Not in Chrome's protocol, but clients that enable every domain
+        // they listen on send them; nothing is gated on them here.
+        .enable, .disable => return cmd.sendResult(null, .{}),
         .clearCookies => return clearCookies(cmd),
         .getCookies => return getCookies(cmd),
         .setCookies => return setCookies(cmd),

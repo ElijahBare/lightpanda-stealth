@@ -225,3 +225,7 @@ const testing = @import("../../testing.zig");
 test "WebApi: ShadowRoot" {
     try testing.htmlRunner("shadowroot", .{});
 }
+
+test "WebApi: ShadowRoot force_open_shadow_roots" {
+    try testing.htmlRunner("force_open_shadow_roots.html", .{ .force_open_shadow_roots = true });
+}

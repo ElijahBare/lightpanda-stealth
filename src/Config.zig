@@ -287,6 +287,7 @@ const CommonOptions = .{
     .{ .name = "locale", .type = [:0]const u8, .default = HttpHeaders.default_locale, .validator = localeValidator },
     .{ .name = "timezone", .type = ?[:0]const u8, .validator = timezoneValidator },
     .{ .name = "block_private_networks", .type = bool },
+    .{ .name = "force_open_shadow_roots", .type = bool },
     .{ .name = "block_cidrs", .type = ?[]const u8, .validator = accumulateValidator },
     .{ .name = "block_urls", .type = ?[]const u8, .validator = accumulateValidator },
     .{ .name = "adblock_lists", .type = ?[]const u8, .validator = accumulateValidator, .path = true },
@@ -926,6 +927,13 @@ pub fn webBotAuth(self: *const Config) ?WebBotAuthConfig {
 pub fn blockPrivateNetworks(self: *const Config) bool {
     return switch (self.mode) {
         inline .serve, .fetch, .mcp, .agent => |opts| opts.block_private_networks,
+        else => unreachable,
+    };
+}
+
+pub fn forceOpenShadowRoots(self: *const Config) bool {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.force_open_shadow_roots,
         else => unreachable,
     };
 }

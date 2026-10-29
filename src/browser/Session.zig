@@ -116,6 +116,9 @@ load_resources: Config.LoadResources,
 // opt-in unstable features (--experimental-features)
 experimental_features: Config.ExperimentalFeatures,
 
+// attachShadow treats every mode as "open" (--force-open-shadow-roots)
+force_open_shadow_roots: bool,
+
 /// Caller-supplied cancellation probe. `Runner._wait` polls it between
 /// ticks; once `check` returns true the wait returns `error.Cancelled`.
 /// The agent installs this so SIGINT can abort an in-flight tool call
@@ -177,6 +180,7 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
         ._console_messages = .init(allocator),
         .load_resources = browser.app.config.loadResources(),
         .experimental_features = browser.app.config.experimentalFeatures(),
+        .force_open_shadow_roots = browser.app.config.forceOpenShadowRoots(),
     };
     errdefer self._console_messages.deinit();
 }
