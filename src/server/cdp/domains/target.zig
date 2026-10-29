@@ -131,7 +131,9 @@ fn createBrowserContext(cmd: *CDP.Command) !void {
         }
     }
 
-    const bc = cmd.createBrowserContext() catch |err| switch (err) {
+    // Like Chrome, an explicitly created context is incognito-like: only the
+    // implicit default one (see createTarget) uses --profile-dir.
+    const bc = cmd.createBrowserContextWith(.{ .ephemeral = true }) catch |err| switch (err) {
         error.AlreadyExists => return cmd.sendError(-32000, "Cannot have more than one browser context at a time", .{}),
         else => return err,
     };

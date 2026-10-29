@@ -67,6 +67,9 @@ pub fn initSession(allocator: std.mem.Allocator, app: *App, writer: *std.Io.Writ
     // Only the default session is backed by the on-disk cookie file; named
     // sessions start clean so agents stay isolated by default.
     if (isDefault(id)) {
+        if (app.config.profileDir()) |profile_dir| {
+            lp.profile.load(entry.session, profile_dir);
+        }
         if (app.config.cookieFile()) |cookie_path| {
             lp.cookies.loadFromFile(entry.session, cookie_path);
         }
@@ -88,6 +91,9 @@ pub fn deinit(self: *Self) void {
     if (isDefault(self.session_id)) {
         if (self.app.config.cookieJarFile()) |cookie_jar_path| {
             lp.cookies.saveToFile(&entry.session.cookie_jar, cookie_jar_path);
+        }
+        if (self.app.config.profileDir()) |profile_dir| {
+            lp.profile.save(entry.session, profile_dir);
         }
     }
     entry.enterIsolate();
