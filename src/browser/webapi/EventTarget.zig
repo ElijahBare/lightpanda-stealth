@@ -38,6 +38,9 @@ const Permissions = @import("Permissions.zig");
 const Notification = @import("Notification.zig");
 const PaymentRequest = @import("payment/PaymentRequest.zig");
 const PaymentResponse = @import("payment/PaymentResponse.zig");
+const RTCDataChannel = @import("webrtc/RTCDataChannel.zig");
+const RTCPeerConnection = @import("webrtc/RTCPeerConnection.zig");
+const MediaDevices = @import("media/MediaDevices.zig");
 const SharedWorker = @import("SharedWorker.zig");
 const ServiceWorker = @import("ServiceWorker.zig");
 const ServiceWorkerContainer = @import("ServiceWorkerContainer.zig");
@@ -98,6 +101,7 @@ pub const Type = enum(u8) {
     idb_database,
     idb_request,
     idb_transaction,
+    media_devices,
     media_query_list,
     message_port,
     navigation,
@@ -108,6 +112,8 @@ pub const Type = enum(u8) {
     payment_response,
     performance,
     permission_status,
+    rtc_data_channel,
+    rtc_peer_connection,
     screen,
     screen_orientation,
     service_worker,
@@ -146,6 +152,7 @@ pub fn Subtype(comptime tag: Type) type {
         .idb_database => IDBDatabase,
         .idb_request => IDBRequest,
         .idb_transaction => IDBTransaction,
+        .media_devices => MediaDevices,
         .media_query_list => MediaQueryList,
         .message_port => MessagePort,
         .navigation => Navigation,
@@ -156,6 +163,8 @@ pub fn Subtype(comptime tag: Type) type {
         .payment_response => PaymentResponse,
         .performance => Performance,
         .permission_status => Permissions.PermissionStatus,
+        .rtc_data_channel => RTCDataChannel,
+        .rtc_peer_connection => RTCPeerConnection,
         .screen => Screen,
         .screen_orientation => Screen.Orientation,
         .service_worker => ServiceWorker,
@@ -429,6 +438,9 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
         .payment_request => writer.writeAll("<PaymentRequest>"),
         .payment_response => writer.writeAll("<PaymentResponse>"),
         .permission_status => writer.writeAll("<PermissionStatus>"),
+        .media_devices => writer.writeAll("<MediaDevices>"),
+        .rtc_data_channel => writer.writeAll("<RTCDataChannel>"),
+        .rtc_peer_connection => writer.writeAll("<RTCPeerConnection>"),
         .navigation_history_entry => writer.writeAll("<NavigationHistoryEntry>"),
     };
 }
@@ -460,6 +472,9 @@ pub fn toString(self: *EventTarget) []const u8 {
         .payment_response => return "[object PaymentResponse]",
         .performance => return "[object Performance]",
         .permission_status => return "[object PermissionStatus]",
+        .media_devices => return "[object MediaDevices]",
+        .rtc_data_channel => return "[object RTCDataChannel]",
+        .rtc_peer_connection => return "[object RTCPeerConnection]",
         .screen => return "[object Screen]",
         .screen_orientation => return "[object ScreenOrientation]",
         .service_worker => return "[object ServiceWorker]",
